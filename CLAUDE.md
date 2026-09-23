@@ -24,7 +24,7 @@ Become confident, interview-ready (SME level) on every Kubernetes object by buil
 - No public DNS: hostname `garamchai.test` via the Windows hosts file
 
 ## 🚨 Current state (2026-09-23)
-Cluster **rebuilt and healthy** after the etcd data-loss incident (see `journal/2026-09-23.md`). Rebuild runbook `docs/phases/phase-00-rebuild.md`: R1–R9 done; **next: R10 etcd backup, then first git commit/push (Step 0.3)**.
+Cluster **rebuilt and healthy** after the etcd data-loss incident (see `journal/2026-09-23.md`). Repo pushed to GitHub (public). **Next session: R10c (systemd timer for etcd backups + restore drill), then the Phase 0 self-check, then Phase 1 requirements.**
 
 ## ⏰ Open reminders (remind Vishal at the right time)
 - **Before Phase 5 (storage):** Vishal will add a dedicated **100 GB disk to cka-m** for NFS data (keep it separate from `/`, mount at `/srv/nfs`). Needs VM time, so remind at the end of Phase 4. Tip: VMware Workstation can usually hot-add a SCSI disk without a reboot (then rescan with `echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan`)

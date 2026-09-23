@@ -303,6 +303,6 @@ git status; git add -A; git commit -m "what I did"; git push
 - [x] 0.2 `kubectl get nodes` works from Windows (context `kubernetes-admin@networknuts`, server `https://192.168.64.128:6443`, tls-server-name `kubernetes`)
 - [x] Second kubectl found: **Docker Desktop** ships its own (`...\DockerDesktop\resources\bin\kubectl.exe`, v1.36.1), and it came first on PATH. Fix: put `C:\tools\kubectl` at the **front** of the user PATH (don't delete Docker's copy, because Docker Desktop restores it on every update)
 - [x] `/home/redhat/admin.conf` deleted on cka-m
-- [ ] 0.3 Repo pushed to GitHub
-- [ ] Check whether node IPs are static or DHCP (`cat /etc/netplan/*.yaml` on each node). A DHCP IP that changes after a reboot breaks the cluster
+- [x] 0.3 Repo pushed to GitHub: github.com/vishalbhilare9788-eng/garamchai-k8s (public), first commit d1f3519 on 2026-09-23
+- [x] Node IPs: the cluster network (ens34) is static. ens33 is still DHCP, but since the rebuild only the Windows hosts entry for `k8s-api` depends on it
 - [ ] Self-check: explain to Claude (1) Capacity vs Allocatable, (2) why cka-w2 got a taint you never added, (3) namespaced vs cluster-scoped objects
