@@ -1,0 +1,51 @@
+# kubeadm-config.yaml: how the GaramChai lab cluster is built (used with: kubeadm init --config)
+# Rebuilt 2026-09-23 after the etcd data-loss incident (see journal/2026-09-23.md).
+# Base: the original /root/kubeadm-config.yaml from Sep 6, cleaned up and made explicit.
+# Network values follow ADR-003 (docs/adr/ADR-003-cluster-network-layout.md).
+# NOTE: no "---" before the first document. A comment-only document has no apiVersion/kind,
+#       and kubeadm rejects it ("kind and apiVersion is mandatory"). "---" goes only BETWEEN documents.
+
+apiVersion: kubeadm.k8s.io/v1beta4        # kubeadm config API version used by kubeadm 1.31+
+kind: ClusterConfiguration                 # settings shared by the WHOLE cluster (stored in the kubeadm-config ConfigMap)
+kubernetesVersion: v1.35.8                 # pin the version: a rebuild must produce the same cluster, not "whatever is latest"
+clusterName: networknuts                   # kept from the original build; it's the cluster entry name in kubeconfigs
+controlPlaneEndpoint: "k8s-api:6443"       # the STABLE address of the API server. A DNS name, never a node IP, so a
+                                           # load balancer / more masters can be added later. It CANNOT be changed easily
+                                           # after init. Resolved via /etc/hosts: nodes -> 10.0.0.100, Windows -> 192.168.64.128
+                                           # kubeadm automatically adds "k8s-api" to the API server certificate (SAN)
+networking:
+  podSubnet: "172.17.0.0/16"               # pod IPs (Calico hands out a /26 block per node from this range)
+  serviceSubnet: "10.96.0.0/16"            # ClusterIPs; 10.96.0.1 = kubernetes API Service, 10.96.0.10 = kube-dns
+  dnsDomain: "cluster.local"               # DNS suffix: <svc>.<ns>.svc.cluster.local (the default, written down on purpose)
+etcd:
+  local:
+    dataDir: "/var/lib/etcd"               # stacked etcd: runs as a static pod on the master, data on the master's disk
+
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration                    # settings for THIS node only (the first control-plane node)
+localAPIEndpoint:
+  advertiseAddress: "10.0.0.100"           # the IP this API server announces to the cluster: ens34, static (ADR-003)
+  bindPort: 6443
+nodeRegistration:
+  name: cka-m                              # Node object name (defaults to the hostname; explicit = no surprises)
+  criSocket: "unix:///var/run/crio/crio.sock"   # container runtime = CRI-O (not containerd)
+  kubeletExtraArgs:                        # v1beta4 format: a list of name/value pairs
+    - name: node-ip
+      value: "10.0.0.100"                  # node InternalIP = static cluster network. Workers get theirs from /etc/default/kubelet
+  # taints: not set, so kubeadm applies the default node-role.kubernetes.io/control-plane:NoSchedule
+
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration                 # kubelet settings, applied to EVERY node (kubeadm stores them in the kubelet-config ConfigMap)
+serializeImagePulls: false                 # allow more than one image pull at a time...
+maxParallelImagePulls: 3                   # ...but only 3: 2 vCPUs and an HDD can't take 10 parallel pulls
+evictionHard:                              # when a node gets this low, the kubelet evicts pods to protect itself.
+                                           # All 5 signals are listed on purpose, so none can end up unset.
+  memory.available: "200Mi"                # free RAM below 200 Mi (default is 100Mi; nodes are small, so keep a bigger buffer)
+  nodefs.available: "20%"                  # root filesystem (logs, emptyDir, kubelet data) below 20 % free (default 10 %)
+  nodefs.inodesFree: "5%"                  # running out of inodes (many small files) also breaks a node
+  imagefs.available: "15%"                 # filesystem holding container images below 15 % free (default)
+  imagefs.inodesFree: "5%"
+# Known harmless warning at join: "recommended bindAddress for KubeProxyConfiguration is ::" (dual-stack advice; we are IPv4-only, 0.0.0.0 is fine).
+# cgroupDriver: not set, kubeadm defaults it to systemd, which matches CRI-O's default. Both MUST agree.

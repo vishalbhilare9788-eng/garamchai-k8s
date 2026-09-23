@@ -1,0 +1,4 @@
+# Keep Linux line endings: these files run on Linux VMs
+* text=auto eol=lf
+*.png binary
+*.jpg binary

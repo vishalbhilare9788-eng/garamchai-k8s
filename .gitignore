@@ -1,0 +1,42 @@
+# ---- Secrets: NEVER commit real secrets ----
+# Commit only *.example.yaml templates. Real secret manifests stay local.
+*secret*.yaml
+!*secret*.example.yaml
+*.env
+.env*
+!.env.example
+
+# ---- Certificates & keys (we generate our own CA in Phase 7) ----
+*.key
+*.pem
+*.crt
+*.csr
+*.srl
+certs/
+
+# ---- kubeconfig files ----
+*kubeconfig*
+!concepts/*kubeconfig*
+
+# ---- App build artifacts ----
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+bin/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# ---- Cluster backups & bootstrap output: contain secrets (etcd data, CA keys, join tokens) ----
+*.db
+*.tgz
+*.tar.gz
+*.snapshot
+kubeadm-init.log
+etcd-backup*/
