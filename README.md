@@ -15,6 +15,7 @@
 | [concepts/](concepts/) | One deep-dive file per Kubernetes object |
 | [concepts/00-cluster-networking.md](concepts/00-cluster-networking.md) | Our lab network explained, CoreDNS, production network design (interview-ready) |
 | [concepts/00-how-a-cluster-comes-alive.md](concepts/00-how-a-cluster-comes-alive.md) | The cluster "boot process": pre-build checklist, kubeadm init/join step by step, default objects |
+| [concepts/00-etcd-backup-restore.md](concepts/00-etcd-backup-restore.md) | etcd backup & restore in plain words: why, checklist, backup, restore, validate |
 | [docs/guides/git-basics.md](docs/guides/git-basics.md) | The git commands we use, explained |
 | [journal/](journal/) | Session-by-session log |
 | [interview/question-bank.md](interview/question-bank.md) | Interview questions collected along the way |
