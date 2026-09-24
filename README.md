@@ -17,11 +17,13 @@
 | [concepts/00-how-a-cluster-comes-alive.md](concepts/00-how-a-cluster-comes-alive.md) | The cluster "boot process": pre-build checklist, kubeadm init/join step by step, default objects |
 | [concepts/00-etcd-backup-restore.md](concepts/00-etcd-backup-restore.md) | etcd backup & restore in plain words: why, checklist, backup, restore, validate |
 | [docs/guides/git-basics.md](docs/guides/git-basics.md) | The git commands we use, explained |
+| [docs/study/](docs/study/README.md) | **Phase-wise study PDFs** with diagrams, quizzes and answers (start here to revise) |
+| [docs/guides/high-availability-99.99.pdf](docs/guides/high-availability-99.99.pdf) | Study guide: 99.99% on AWS (SLA/SLO/SLI, error budget, MTTR, RPO/RTO, availability math, DR, cost). Source: `.html` next to it |
 | [journal/](journal/) | Session-by-session log |
 | [interview/question-bank.md](interview/question-bank.md) | Interview questions collected along the way |
 
 ## Phase progress
-- [ ] Phase 0: Foundation & cluster audit
+- [x] Phase 0: Foundation & cluster audit (done 2026-09-25)
 - [ ] Phase 1: Requirements & architecture
 - [ ] Phase 2: Build & containerize (Dockerfiles, Docker Hub)
 - [ ] Phase 3: First deployment (Pod → ReplicaSet → Deployment, ConfigMap, Secret, Probes)

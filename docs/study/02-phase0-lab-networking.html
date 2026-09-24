@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Lab Networking</title>
+<link rel="stylesheet" href="study.css"></head><body>
+
+<section class="cover">
+  <div class="kicker">Phase 0 · Study notes 2 of 5</div>
+  <h1>Kubernetes Networking in Our Lab</h1>
+  <div class="sub">The four networks, why they must never overlap, how a packet really travels,<br>what we fixed (ADR-003), CoreDNS, and how to design K8s networking in production</div>
+  <div class="box"><span class="label">Why this matters</span>
+  Networking is the hardest thing to change after a cluster exists. The Pod CIDR, Service CIDR, CNI and node addressing are effectively permanent; changing them usually means rebuilding the cluster. That's why interviewers love networking questions.</div>
+  <h3>Contents</h3>
+  <ol>
+    <li>The building analogy</li>
+    <li>The four networks and why they must never overlap</li>
+    <li>The lab diagram with real addresses</li>
+    <li>Follow the packet: 6 journeys</li>
+    <li>What we changed in Phase 0 (ADR-003) and the split-horizon <code>k8s-api</code> name</li>
+    <li>CoreDNS: the cluster's phone directory</li>
+    <li>Designing K8s networking in production (on-prem, AWS, Azure)</li>
+    <li>Quiz and answer key</li>
+  </ol>
+  <div class="meta">Lab: 3 VMs on VMware Workstation, 2 NICs each · Calico IPIP · written 2026-09-25</div>
+</section>
+
+<h2 class="pb">1. The building analogy</h2>
+<p>Think of your laptop as a <b>building</b> and the 3 VMs as <b>3 flats</b> inside it.</p>
+<table>
+<tr><th>Real thing</th><th>Analogy</th></tr>
+<tr><td>Windows laptop</td><td>The building owner's office</td></tr>
+<tr><td>VMware NAT network (VMnet8), 192.168.64.0/24</td><td>The <b>main road</b>: connects the flats to the owner's office and, through the gate, to the internet</td></tr>
+<tr><td>VMware host-only network, 10.0.0.0/24</td><td>A <b>private corridor</b> between the flats. The owner's office has no door onto it</td></tr>
+<tr><td>Pod network 172.17.0.0/16</td><td>The <b>rooms inside each flat</b>. Each flat numbers its rooms from its own block</td></tr>
+<tr><td>Service network 10.96.0.0/16</td><td><b>Reception phone extensions</b>: numbers that don't belong to any room; dial one and reception forwards you to a real room</td></tr>
+<tr><td>CoreDNS</td><td>The <b>phone directory</b>: ask for "discount-service", get the extension number</td></tr>
+</table>
+
+<h2>2. The four networks</h2>
+<table>
+<tr><th>#</th><th>Network</th><th>Range</th><th>Real or virtual?</th><th>Who hands out addresses</th><th>Used for</th></tr>
+<tr><td>1</td><td>LAN / NAT (<code>ens33</code>)</td><td>192.168.64.0/24</td><td>Real (VMware NIC)</td><td>VMware DHCP (.128–.254)</td><td>Internet, <b>Windows → cluster</b>, MetalLB IPs later</td></tr>
+<tr><td>2</td><td>Cluster network (<code>ens34</code>)</td><td>10.0.0.0/24</td><td>Real (VMware NIC)</td><td><b>Static</b> (.100 / .1 / .2)</td><td>API server, kubelet, etcd, Calico tunnels</td></tr>
+<tr><td>3</td><td>Pod network</td><td>172.17.0.0/16</td><td>Virtual (Calico)</td><td>Calico, one /26 block per node</td><td>Every pod's IP</td></tr>
+<tr><td>4</td><td>Service network</td><td>10.96.0.0/16</td><td><b>Purely virtual</b>: on no interface</td><td>API server</td><td>Stable ClusterIPs in front of pods</td></tr>
+</table>
+
+<h3>2.1 Why they must never overlap</h3>
+<p>Linux decides where to send a packet by looking up the destination in its <b>routing table</b>. If two networks share addresses, the lookup can pick the wrong one.</p>
+<pre>Before our fix:  ens34 = 10.0.0.x/8   →  "10.0.0.0 to 10.255.255.255 is on ens34"
+                 Service range 10.96.0.0/16 is INSIDE that  →  overlap
+After:           ens34 = 10.0.0.x/24  →  only 10.0.0.0 – 10.0.0.255   →  no overlap</pre>
+<p>It happened to work before, because kube-proxy rewrites Service IPs before packets leave, but any hiccup would have sent packets down the wrong interface. That's the worst kind of bug to debug.</p>
+<div class="box warn"><span class="label">Two more overlaps to remember</span>
+<ul><li><b>172.17.0.0/16</b> is our Pod CIDR <i>and</i> Docker's default bridge. So <b>never install Docker on the nodes</b>. We build images on Windows (Docker Desktop) instead.</li>
+<li>MetalLB IPs must be <b>below 192.168.64.128</b>, because VMware's DHCP hands out .128–.254.</li></ul></div>
+
+<h2 class="pb">3. The lab diagram</h2>
+<svg width="680" height="390" viewBox="0 0 680 390" role="img" aria-label="Lab network diagram">
+ <g font-family="Segoe UI, Arial" font-size="10.5">
+  <rect x="245" y="5" width="190" height="42" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="255" y="22" font-weight="700">Windows 11 laptop</text><text x="255" y="38">VMnet8 192.168.64.1 · kubectl</text>
+  <line x1="340" y1="47" x2="340" y2="70" stroke="#1f2328"/>
+  <rect x="10" y="70" width="660" height="26" fill="#eef5fc" stroke="#0b5cad"/><text x="20" y="87" font-weight="700" fill="#0b5cad">Network 1: LAN / NAT 192.168.64.0/24 (ens33, DHCP): Windows CAN reach it · internet via 192.168.64.2</text>
+  <line x1="115" y1="96" x2="115" y2="120" stroke="#1f2328"/><text x="120" y="112">.128</text>
+  <line x1="340" y1="96" x2="340" y2="120" stroke="#1f2328"/><text x="345" y="112">.129</text>
+  <line x1="565" y1="96" x2="565" y2="120" stroke="#1f2328"/><text x="570" y="112">.131</text>
+  <rect x="15" y="120" width="200" height="170" rx="5" fill="#fff" stroke="#1f2328"/>
+  <text x="25" y="138" font-weight="700">cka-m (control plane)</text><text x="25" y="156">apiserver :6443, etcd,</text><text x="25" y="172">scheduler, controller-mgr</text><text x="25" y="188">CoreDNS ×2</text>
+  <rect x="25" y="200" width="180" height="48" rx="3" fill="#eaf7ee" stroke="#2e8b57"/><text x="33" y="218">pods 172.17.44.0/26</text><text x="33" y="236">tunl0 (IPIP)</text>
+  <rect x="240" y="120" width="200" height="170" rx="5" fill="#fff" stroke="#1f2328"/>
+  <text x="250" y="138" font-weight="700">cka-w1 (worker)</text><text x="250" y="156">kubelet, kube-proxy,</text><text x="250" y="172">calico-node</text>
+  <rect x="250" y="200" width="180" height="48" rx="3" fill="#eaf7ee" stroke="#2e8b57"/><text x="258" y="218">pods 172.17.95.128/26</text><text x="258" y="236">tunl0 (IPIP)</text>
+  <rect x="465" y="120" width="200" height="170" rx="5" fill="#fff" stroke="#1f2328"/>
+  <text x="475" y="138" font-weight="700">cka-w2 (worker)</text><text x="475" y="156">kubelet, kube-proxy,</text><text x="475" y="172">calico-node</text>
+  <rect x="475" y="200" width="180" height="48" rx="3" fill="#eaf7ee" stroke="#2e8b57"/><text x="483" y="218">pods 172.17.62.128/26</text><text x="483" y="236">tunl0 (IPIP)</text>
+  <line x1="115" y1="290" x2="115" y2="312" stroke="#1f2328"/><text x="120" y="305">.100</text>
+  <line x1="340" y1="290" x2="340" y2="312" stroke="#1f2328"/><text x="345" y="305">.1</text>
+  <line x1="565" y1="290" x2="565" y2="312" stroke="#1f2328"/><text x="570" y="305">.2</text>
+  <rect x="10" y="312" width="660" height="26" fill="#eaf7ee" stroke="#2e8b57"/><text x="20" y="329" font-weight="700" fill="#2e8b57">Network 2: CLUSTER 10.0.0.0/24 (ens34, host-only, STATIC): Windows can NOT reach it</text>
+  <text x="15" y="358">Network 3: PODS 172.17.0.0/16, virtual, carried inside network 2 by IPIP tunnels</text>
+  <text x="15" y="376">Network 4: SERVICES 10.96.0.0/16, virtual, only iptables rules · 10.96.0.1 = kubernetes API · 10.96.0.10 = kube-dns</text>
+ </g>
+</svg>
+
+<h2>4. Follow the packet: 6 journeys</h2>
+<h3>① kubectl on Windows → API server</h3>
+<pre>Windows ──(network 1)──► 192.168.64.128:6443 on cka-m ──► kube-apiserver
+kubeconfig uses the name k8s-api, which Windows resolves to 192.168.64.128 (hosts file)</pre>
+<h3>② Worker → API server (kubelet reporting "I'm alive")</h3>
+<pre>cka-w1 10.0.0.1 ──(network 2)──► k8s-api = 10.0.0.100:6443     static on both ends: DHCP can't break it</pre>
+<h3>③ Pod on w1 → pod on w2 (IPIP: an envelope inside an envelope)</h3>
+<svg width="640" height="110" viewBox="0 0 640 110" role="img" aria-label="IPIP encapsulation">
+ <g font-family="Segoe UI, Arial" font-size="11">
+  <rect x="20" y="10" width="600" height="90" rx="6" fill="#eef5fc" stroke="#0b5cad"/>
+  <text x="32" y="30" font-weight="700" fill="#0b5cad">Outer envelope (node → node, network 2):  from 10.0.0.1  →  to 10.0.0.2</text>
+  <rect x="45" y="42" width="550" height="46" rx="5" fill="#eaf7ee" stroke="#2e8b57"/>
+  <text x="57" y="62" font-weight="700" fill="#2e8b57">Inner envelope (pod → pod): from 172.17.95.130 → to 172.17.62.131</text>
+  <text x="57" y="80">the real data (e.g. order-service calling discount-service)</text>
+ </g>
+</svg>
+<p>How does cka-w1 know that 172.17.62.128/26 lives on cka-w2? Calico's BGP agent (<b>BIRD</b>) shares routes between nodes:</p>
+<pre>172.17.62.128/26 via 10.0.0.2 dev tunl0 proto bird
+172.17.95.128/26 via 10.0.0.1 dev tunl0 proto bird</pre>
+<h3>④ Pod → Service IP (e.g. DNS at 10.96.0.10)</h3>
+<pre>pod ──► dst 10.96.0.10:53
+        iptables rules (written by kube-proxy on EVERY node) rewrite the destination:
+        10.96.0.10 → one of the CoreDNS pods        ← this is DNAT
+    ──► then travels like journey ③</pre>
+<p>No machine owns 10.96.0.10. It's a rule, not an interface. So you <b>can't ping a Service IP</b> (ICMP isn't covered by the rules), but you <b>can</b> connect to its port.</p>
+<h3>⑤ Pod → internet</h3>
+<pre>pod ──► node rewrites the source to its own IP (SNAT / masquerade) ──► ens33 ──► VMware NAT ──► internet</pre>
+<h3>⑥ Browser → GaramChai (Phase 7, not built yet)</h3>
+<pre>browser ──► https://garamchai.test (hosts file → a MetalLB IP such as 192.168.64.50)
+        ──► MetalLB answers ARP "that IP is at cka-w1's MAC" ──► Traefik ──► app pods</pre>
+
+<div class="box warn"><span class="label">Lab gotcha: ping doesn't work inside pods</span>
+CRI-O's default capabilities exclude <code>NET_RAW</code>, which <code>ping</code> needs, so ping fails with "permission denied" (containerd's defaults include it). Test with TCP instead: <code>wget</code>, <code>nc</code>, <code>curl</code>.</div>
+
+<h2 class="pb">5. What we changed in Phase 0 (ADR-003)</h2>
+<table>
+<tr><th>Change</th><th>Before</th><th>After</th><th>Why</th></tr>
+<tr><td>ens34 mask</td><td>/8</td><td>/24</td><td>Removed the overlap with the Service range</td></tr>
+<tr><td>kubelet <code>--node-ip</code></td><td>not set → kubelet picked ens33 (DHCP)</td><td>10.0.0.100 / .1 / .2</td><td>The node's InternalIP is now static. The API server uses it for <code>kubectl logs/exec</code> (port 10250)</td></tr>
+<tr><td>Calico node IP</td><td>auto-detected</td><td><code>IP_AUTODETECTION_METHOD=cidr=10.0.0.0/24</code></td><td>With 2 NICs, every component must pick the <b>same</b> NIC</td></tr>
+<tr><td>API endpoint</td><td>a node IP</td><td><code>controlPlaneEndpoint: k8s-api:6443</code></td><td>A stable name; HA possible later</td></tr>
+</table>
+<h3>5.1 Split-horizon name resolution for <code>k8s-api</code></h3>
+<p>The same name resolves to a <b>different address depending on who asks</b>:</p>
+<table>
+<tr><th>Who asks</th><th>File</th><th><code>k8s-api</code> resolves to</th><th>Why</th></tr>
+<tr><td>The nodes</td><td><code>/etc/hosts</code></td><td>10.0.0.100</td><td>Cluster traffic stays on the static network</td></tr>
+<tr><td>Windows</td><td><code>C:\Windows\System32\drivers\etc\hosts</code></td><td>192.168.64.128</td><td>The only network Windows can reach</td></tr>
+</table>
+<p>Because kubeadm puts <code>k8s-api</code> into the API server's certificate, the TLS check passes from both sides. No certificate hacks, no <code>insecure-skip-tls-verify</code>.</p>
+<div class="box ok"><span class="label">Interview line</span>
+"In my lab the nodes had two NICs, and each Kubernetes component was picking a different one. I pinned everything (API server advertise address, kubelet node-ip, Calico autodetection) to a static /24, which also removed an overlap between a /8 node network and the Service CIDR. The API endpoint is a DNS name with split-horizon resolution, so the cluster doesn't depend on DHCP."</div>
+
+<h2>6. CoreDNS: the cluster's phone directory</h2>
+<p>Pods get a new IP every time they restart, so apps never use pod IPs. They use <b>names</b>, and CoreDNS turns a name into the Service's stable IP.</p>
+<pre>kubectl -n kube-system get deployment coredns   # 2 replicas
+kubectl -n kube-system get svc kube-dns         # 10.96.0.10: still called kube-dns, a historical name
+kubectl -n kube-system get configmap coredns -o yaml   # its config, the "Corefile"</pre>
+<p>The kubelet writes every pod's <code>/etc/resolv.conf</code>:</p>
+<pre>nameserver 10.96.0.10
+search garamchai.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</pre>
+<table>
+<tr><th>You ask for</th><th>You get</th><th>GaramChai example</th></tr>
+<tr><td><code>&lt;svc&gt;</code> (same namespace)</td><td>Service ClusterIP (via the search list)</td><td><code>http://discount-service</code></td></tr>
+<tr><td><code>&lt;svc&gt;.&lt;namespace&gt;</code></td><td>Service ClusterIP</td><td><code>postgres.garamchai-data</code></td></tr>
+<tr><td><code>&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>Service ClusterIP (full name, FQDN)</td><td>our test: <code>kubernetes.default.svc.cluster.local → 10.96.0.1</code></td></tr>
+<tr><td>Headless Service</td><td>All pod IPs directly</td><td>Postgres StatefulSet (Phase 5)</td></tr>
+<tr><td><code>&lt;pod&gt;.&lt;svc&gt;.&lt;ns&gt;.svc.cluster.local</code></td><td>One specific StatefulSet pod</td><td><code>postgres-0.postgres.garamchai-data…</code></td></tr>
+<tr><td><code>google.com</code></td><td>Forwarded to the node's upstream DNS</td><td>calling an external API</td></tr>
+</table>
+<div class="box warn"><span class="label">Two DNS gotchas we hit or should know</span>
+<ul><li><b>busybox nslookup:</b> versions after 1.28 ignore the <code>search</code> line, so <code>nslookup kubernetes.default</code> returns NXDOMAIN even when DNS is fine. Use the FQDN, or busybox:1.28.</li>
+<li><b><code>ndots:5</code>:</b> names with fewer than 5 dots try the search suffixes <i>first</i>, so <code>google.com</code> causes 3–4 wasted lookups. Fixes: trailing dot (<code>google.com.</code>), <code>dnsConfig</code> per pod, or NodeLocal DNSCache.</li></ul></div>
+<h3>6.1 "A pod can't resolve names": the checklist</h3>
+<ol>
+<li>Are the CoreDNS pods running? <code>kubectl -n kube-system get pods -l k8s-app=kube-dns</code></li>
+<li>Does the <code>kube-dns</code> Service have endpoints? (<code>get endpointslices</code>)</li>
+<li>From a test pod, look up the <b>FQDN</b>.</li>
+<li>Check <code>/etc/resolv.conf</code> inside the failing pod.</li>
+<li>Read the CoreDNS logs.</li>
+<li>Is a NetworkPolicy blocking UDP/TCP 53? (We'll meet this in Phase 8.)</li>
+</ol>
+
+<h2 class="pb">7. Designing K8s networking in production</h2>
+<h3>7.1 The 7 questions, in order</h3>
+<table>
+<tr><th>#</th><th>Question</th><th>Typical mistake</th></tr>
+<tr><td>1</td><td><b>IP plan:</b> node, Pod, Service ranges that don't collide with each other, the corporate LAN, VPNs, peered VPCs or other clusters</td><td>Using 10.0.0.0/8 or 172.17.0.0/16 without checking; ranges too small</td></tr>
+<tr><td>2</td><td><b>CNI:</b> overlay (Calico, Cilium) or routable pod IPs (AWS VPC CNI, Azure CNI)? NetworkPolicy support?</td><td>Flannel (no NetworkPolicy); running out of subnet IPs</td></tr>
+<tr><td>3</td><td><b>HA topology:</b> nodes across zones; 3 control-plane nodes; a load-balanced API endpoint</td><td>A single master; API address tied to one machine</td></tr>
+<tr><td>4</td><td><b>Ingress:</b> L4 load balancer + L7 controller, TLS, WAF</td><td>NodePorts exposed to users</td></tr>
+<tr><td>5</td><td><b>Egress:</b> NAT gateway, fixed egress IPs for partners</td><td>Random egress IPs a bank can't whitelist</td></tr>
+<tr><td>6</td><td><b>DNS:</b> CoreDNS, corporate DNS forwarding, ExternalDNS</td><td>Corporate names not resolvable from pods</td></tr>
+<tr><td>7</td><td><b>Security:</b> private subnets, firewalls/security groups, default-deny NetworkPolicy, private API endpoint</td><td>Flat network; API server on the internet</td></tr>
+</table>
+<p>Also check <b>MTU</b> (overlays add headers: IPIP 20 bytes, VXLAN 50; a mismatch gives "small requests work, big ones hang") and <b>firewall ports</b>: 6443 API, 2379–2380 etcd, 10250 kubelet, 30000–32767 NodePort, 179/TCP BGP, IP protocol 4 for IPIP, 4789/UDP VXLAN.</p>
+
+<h3>7.2 On-prem vs AWS vs Azure</h3>
+<table>
+<tr><th>Topic</th><th>On-prem (like our lab)</th><th>AWS (EKS)</th><th>Azure (AKS)</th></tr>
+<tr><td>Pod networking</td><td>Calico/Cilium overlay, or BGP to the switches</td><td>AWS VPC CNI: pods get <b>real VPC IPs</b> (size subnets, prefix delegation, or secondary CIDR)</td><td>Azure CNI Overlay (common default), Azure CNI with VNet IPs, or Cilium</td></tr>
+<tr><td>API HA</td><td>You build it: 3 masters + VIP (kube-vip / keepalived + HAProxy)</td><td>Managed by AWS</td><td>Managed; private-cluster option</td></tr>
+<tr><td><code>type: LoadBalancer</code></td><td><b>MetalLB</b> or hardware (F5)</td><td>AWS Load Balancer Controller (NLB / ALB)</td><td>Azure Load Balancer; App Gateway for L7</td></tr>
+<tr><td>Egress</td><td>Corporate firewall / proxy</td><td>NAT Gateway per AZ; VPC endpoints</td><td>NAT Gateway or Azure Firewall</td></tr>
+<tr><td>Biggest trap</td><td>Nobody plans IPs; DHCP node IPs</td><td>Running out of pod IPs in small subnets</td><td>Picking a mode that eats VNet IPs</td></tr>
+</table>
+<div class="box ok"><span class="label">60-second interview answer</span>
+"I start with the IP plan, because it's the one thing you can't change later: node, pod and service ranges that don't overlap with each other or anything the cluster connects to. Then the CNI: an overlay like Calico or Cilium on-prem, or the cloud CNI on EKS/AKS with subnets sized for pod IPs. Then HA: nodes across zones and a load-balanced API endpoint. Then traffic in (load balancer + Ingress or Gateway with TLS) and out (NAT with fixed egress IPs). Then DNS, then security: private subnets, security groups, default-deny NetworkPolicies, a private API endpoint. In my lab I found and fixed a /8 node network overlapping the Service CIDR and node IPs on DHCP."</div>
+
+<h2 class="pb">8. Quiz</h2>
+<ol class="quiz">
+<li>Name our four networks with their ranges, and say which ones are purely virtual.</li>
+<li>Why did ens34 at /8 cause a problem, even though everything "worked"?</li>
+<li>Why must we never install Docker on the nodes?</li>
+<li>Why must MetalLB IPs be below 192.168.64.128?</li>
+<li>Explain IPIP encapsulation using the envelope picture. Which addresses are on the outer and inner envelopes?</li>
+<li>How does cka-w1 know which node owns 172.17.62.128/26?</li>
+<li>Why can't you ping a ClusterIP, even though you can connect to its port?</li>
+<li>What does kube-proxy actually do when a pod connects to 10.96.0.10?</li>
+<li>What is split-horizon DNS, and how does <code>k8s-api</code> use it in our lab?</li>
+<li>With 2 NICs per node, which three settings did we pin to the cluster network?</li>
+<li><code>ping</code> fails inside a pod with "permission denied". Is the network broken? How do you test instead?</li>
+<li>What is the Service <code>kube-dns</code>, and why is it called that when we run CoreDNS?</li>
+<li><code>nslookup kubernetes.default</code> returns NXDOMAIN, but the FQDN works. What happened?</li>
+<li>What does <code>ndots:5</code> do, and why can it hurt at scale?</li>
+<li>A pod can't resolve names. List your troubleshooting steps in order.</li>
+<li>On AWS EKS with the VPC CNI, what's the biggest networking trap?</li>
+<li>Which network ranges must not overlap when you design a production cluster?</li>
+<li>Symptom: small HTTP requests work, large ones hang. What's the likely cause?</li>
+</ol>
+
+<h2 class="pb">Answer key</h2>
+<ol class="answers">
+<li>LAN/NAT 192.168.64.0/24 (ens33), cluster 10.0.0.0/24 (ens34), Pods 172.17.0.0/16, Services 10.96.0.0/16. Pods are virtual (Calico overlay); Services are purely virtual (only iptables rules).</li>
+<li>/8 covered 10.0.0.0–10.255.255.255, which includes the Service range 10.96.0.0/16. Overlapping ranges can route packets down the wrong interface. It only worked because kube-proxy rewrites Service IPs first.</li>
+<li>Docker's default bridge uses 172.17.0.0/16, the same as our Pod CIDR, which would break pod routing.</li>
+<li>VMware's DHCP hands out .128–.254; a MetalLB IP inside that pool could be given to another machine too.</li>
+<li>The pod's packet (inner: 172.17.95.130 → 172.17.62.131) is wrapped in a node packet (outer: 10.0.0.1 → 10.0.0.2), sent over the cluster network, and unwrapped on the other node.</li>
+<li>Calico's BGP agent (BIRD) shares each node's /26 block, which appears as a route: <code>172.17.62.128/26 via 10.0.0.2 dev tunl0 proto bird</code>.</li>
+<li>No interface owns a ClusterIP; only iptables/IPVS rules for its TCP/UDP ports exist. ICMP isn't translated.</li>
+<li>Nothing at connection time. It has already written iptables rules on every node; the kernel DNATs 10.96.0.10 to one of the CoreDNS pod IPs.</li>
+<li>The same name resolves differently depending on who asks. Nodes: <code>k8s-api</code> → 10.0.0.100 (hosts file); Windows: → 192.168.64.128. Both match the certificate, because <code>k8s-api</code> is in it.</li>
+<li>API server <code>advertiseAddress</code> (10.0.0.100), kubelet <code>--node-ip</code>, and Calico <code>IP_AUTODETECTION_METHOD=cidr=10.0.0.0/24</code>.</li>
+<li>Not necessarily. CRI-O drops the NET_RAW capability that ping needs. Test with TCP (<code>wget</code>, <code>nc</code>, <code>curl</code>).</li>
+<li>The Service in front of the CoreDNS pods (10.96.0.10). The name is historical, from before CoreDNS replaced kube-dns, and kept for compatibility.</li>
+<li>busybox nslookup (after 1.28) ignores the search domains, so it looked up the literal name. DNS itself was fine.</li>
+<li>Names with fewer than 5 dots try the search suffixes first, so external names cause several wasted lookups. That multiplies DNS load. Fix with a trailing dot, dnsConfig, or NodeLocal DNSCache.</li>
+<li>CoreDNS pods running → kube-dns endpoints exist → FQDN lookup from a test pod → the pod's resolv.conf → CoreDNS logs → NetworkPolicy blocking port 53.</li>
+<li>Running out of IP addresses, because every pod takes a real VPC IP. Size subnets properly, use prefix delegation or a secondary CIDR.</li>
+<li>Node/VPC subnets, Pod CIDR, Service CIDR, and every network the cluster will connect to: corporate LAN, VPNs, peered VPCs, other clusters, on-prem data centres.</li>
+<li>An MTU mismatch: the overlay header makes large packets too big, and they get dropped.</li>
+</ol>
+</body></html>

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>etcd Backup and Restore</title>
+<link rel="stylesheet" href="study.css"></head><body>
+
+<section class="cover">
+  <div class="kicker">Phase 0 · Study notes 4 of 5</div>
+  <h1>etcd Backup and Restore</h1>
+  <div class="sub">Why, what to think about first, how to back up, how to automate it,<br>how to restore, and how to prove the restore really worked</div>
+  <div class="box"><span class="label">The whole idea in one line</span>
+  etcd is the cluster's memory. A backup is a photocopy of that memory. A restore is replacing the memory with the photocopy. <b>A backup you've never restored is a hope, not a backup.</b></div>
+  <h3>Contents</h3>
+  <ol>
+    <li>Why back up: what's in etcd and what isn't</li>
+    <li>Think before you back up: the checklist</li>
+    <li>How to back up (commands, explained)</li>
+    <li>Automating it: script, service, timer</li>
+    <li>How to restore, step by step</li>
+    <li>How to validate a restore</li>
+    <li>Common mistakes</li>
+    <li>Quiz and answer key</li>
+  </ol>
+  <div class="meta">etcd 3.6.6 (etcdctl + etcdutl) · stacked etcd on cka-m · restore drill done 2026-09-24</div>
+</section>
+
+<h2 class="pb">1. Why back up</h2>
+<h3>1.1 The restaurant register</h3>
+<p>Imagine a restaurant where nobody remembers anything. The <b>register book</b> at the counter lists every order, table and staff member, and everyone looks things up there.</p>
+<ul>
+<li><b>etcd</b> = the register book.</li>
+<li><b>API server</b> = the only person allowed to write in it or read from it.</li>
+<li><b>Controllers, scheduler, kubelets</b> = staff who keep asking "what does the register say?" and make reality match it.</li>
+</ul>
+<p>If the register burns, containers may keep running for a while, but <b>nobody knows what should exist anymore</b>. That's a dead cluster, and it's exactly what happened to us on 2026-09-23 (study notes 3).</p>
+
+<h3>1.2 What's in etcd, and what isn't</h3>
+<table>
+<tr><th>In etcd (a restore brings it back)</th><th>NOT in etcd (a restore does NOT bring it back)</th></tr>
+<tr><td>Every API object: Namespaces, Deployments, Pods, Services, ConfigMaps, <b>Secrets</b>, RBAC, CRDs, Nodes, Leases</td><td>Data inside <b>PersistentVolumes</b> (database rows, uploads): back those up separately</td></tr>
+<tr><td>The desired state ("3 replicas of X")</td><td>Container images (they're in the registry)</td></tr>
+<tr><td></td><td>The <b>certificates and keys</b> in <code>/etc/kubernetes/pki</code></td></tr>
+</table>
+<div class="box bad"><span class="label">A snapshot is as sensitive as all your passwords together</span>
+Secrets are stored in etcd only base64-encoded (unless encryption at rest is on), so anyone who can read a snapshot can read every Secret. Treat backup files accordingly.</div>
+
+<h2>2. Think before you back up: the checklist</h2>
+<table>
+<tr><th>#</th><th>Question</th><th>Our answer</th><th>Why it matters</th></tr>
+<tr><td>1</td><td>Which tool?</td><td>etcdctl / etcdutl <b>3.6.6</b>, same as the server</td><td>In 3.6, <code>snapshot status/restore</code> moved from etcdctl to <b>etcdutl</b></td></tr>
+<tr><td>2</td><td>How do I connect?</td><td>Endpoint + 3 TLS files, read from <code>etcd.yaml</code></td><td>etcd only talks to clients with a certificate from its own CA</td></tr>
+<tr><td>3</td><td>What else to save?</td><td><code>/etc/kubernetes/pki</code></td><td>The snapshot is the <b>data</b>; the PKI is the <b>identity</b></td></tr>
+<tr><td>4</td><td>Who can read the backup?</td><td>root only (<code>umask 077</code>, folder 700)</td><td>Every Secret + the CA private key</td></tr>
+<tr><td>5</td><td>Where is it stored?</td><td>On cka-m <b>and</b> copied to Windows</td><td>A backup on the same machine dies with it. <b>3-2-1 rule</b>: 3 copies, 2 media, 1 off-site</td></tr>
+<tr><td>6</td><td>How often, how long?</td><td>Every 6 h, keep 7 days (28 snapshots)</td><td>How much can we afford to lose? (RPO = 6 h)</td></tr>
+<tr><td>7</td><td>Who remembers?</td><td>A <b>systemd timer</b></td><td>Manual backups get forgotten; a CronJob would die with the cluster</td></tr>
+<tr><td>8</td><td>Is the file good?</td><td>Verified <i>before</i> it gets its final name</td><td>A corrupt backup found on restore day is worse than none</td></tr>
+<tr><td>9</td><td>Ever restored it?</td><td>Yes, drill on 2026-09-24</td><td>Untested backups are hope</td></tr>
+</table>
+
+<h3>2.1 Why the PKI matters: the ID-card analogy</h3>
+<p>Every component carries an ID card (certificate) stamped by the cluster's CA. If cka-m dies and you run <code>kubeadm init</code> on a new VM, kubeadm creates a <b>new CA</b>, a new stamp. The workers and your Windows kubeconfig carry cards with the <b>old</b> stamp, so nobody trusts anybody: nodes go NotReady, kubectl fails, ServiceAccount tokens stop validating.</p>
+<div class="box ok"><span class="label">The fix interviewers want to hear</span>Put the backed-up <code>/etc/kubernetes/pki</code> back on the new node <b>before</b> <code>kubeadm init</code>. kubeadm reuses certificates it finds, so the cluster keeps its identity.</div>
+
+<h2 class="pb">3. How to back up</h2>
+<h3>3.1 Find the connection details (never guess)</h3>
+<pre>sudo grep -E -- '--(listen-client-urls|trusted-ca-file|cert-file|key-file)=' /etc/kubernetes/manifests/etcd.yaml</pre>
+<table>
+<tr><th>Flag</th><th>Our value</th><th>Plain meaning</th></tr>
+<tr><td><code>--endpoints</code></td><td><code>https://127.0.0.1:2379</code></td><td>Where etcd listens</td></tr>
+<tr><td><code>--cacert</code></td><td><code>/etc/kubernetes/pki/etcd/ca.crt</code></td><td>Which stamp I trust (to check etcd's card)</td></tr>
+<tr><td><code>--cert</code></td><td><code>/etc/kubernetes/pki/etcd/server.crt</code></td><td>My ID card</td></tr>
+<tr><td><code>--key</code></td><td><code>/etc/kubernetes/pki/etcd/server.key</code></td><td>Proves the card is mine</td></tr>
+</table>
+<h3>3.2 Take the snapshot</h3>
+<pre>sudo etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save /var/backups/etcd/etcd-$(date +%F-%H%M).db</pre>
+<p>This asks the <b>running</b> etcd for a consistent copy; no downtime is needed. etcdctl writes <code>&lt;name&gt;.part</code> first and renames it when the download completes.</p>
+<h3>3.3 Check it</h3>
+<pre>sudo etcdutl snapshot status /var/backups/etcd/etcd-2026-09-24-1630.db -w table
+|   HASH   | REVISION | TOTAL KEYS | TOTAL SIZE | VERSION |
+| 62bd7044 |    10111 |        532 |     4.4 MB |   3.6.0 |</pre>
+<table>
+<tr><th>Column</th><th>Meaning</th></tr>
+<tr><td>HASH</td><td>A fingerprint of the content, checked by etcdutl. A damaged file makes the command <b>fail</b></td></tr>
+<tr><td>REVISION</td><td>etcd's change counter: every write adds 1. Ours grew by ~2,600 in 28 minutes with nothing deployed (node heartbeats every 10 s, status updates, events)</td></tr>
+<tr><td>TOTAL KEYS</td><td>Number of stored objects</td></tr>
+<tr><td>VERSION</td><td>Storage format version, always <code>x.y.0</code> (the binary is 3.6.6)</td></tr>
+</table>
+<h3>3.4 Save the PKI</h3>
+<pre>(umask 077; sudo tar czf /var/backups/etcd/pki-$(date +%F).tgz -C /etc/kubernetes pki)</pre>
+<p class="small">Our first PKI tarball was created world-readable (644), a mistake we fixed immediately. That's why <code>umask 077</code> is now in every command and in the script.</p>
+
+<h2>4. Automating it</h2>
+<table>
+<tr><th>File (in <code>infra/etcd-backup/</code>)</th><th>Role</th><th>Analogy</th></tr>
+<tr><td><code>etcd-backup.sh</code></td><td><b>What</b> to do</td><td>The recipe</td></tr>
+<tr><td><code>etcd-backup.service</code></td><td><b>How</b> to run it: as root, once (<code>Type=oneshot</code>), low priority</td><td>The cook</td></tr>
+<tr><td><code>etcd-backup.timer</code></td><td><b>When</b>: every 6 h (<code>OnCalendar=*-*-* 00/6:00:00</code>); <code>Persistent=true</code> runs a missed backup at boot</td><td>The alarm clock</td></tr>
+</table>
+<h3>4.1 What the script does</h3>
+<svg width="680" height="90" viewBox="0 0 680 90" role="img" aria-label="Backup script steps">
+ <defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f2328"/></marker></defs>
+ <g font-family="Segoe UI, Arial" font-size="10.5">
+  <rect x="5" y="20" width="100" height="50" rx="4" fill="#f3f5f7" stroke="#999"/><text x="12" y="40">1. wait until</text><text x="12" y="56">etcd healthy</text>
+  <rect x="120" y="20" width="100" height="50" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="127" y="40">2. snapshot</text><text x="127" y="56">→ …db.tmp</text>
+  <rect x="235" y="20" width="100" height="50" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="242" y="40">3. verify</text><text x="242" y="56">etcdutl status</text>
+  <rect x="350" y="20" width="100" height="50" rx="4" fill="#eaf7ee" stroke="#2e8b57"/><text x="357" y="40">4. rename</text><text x="357" y="56">→ …db (good)</text>
+  <rect x="465" y="20" width="95" height="50" rx="4" fill="#f3f5f7" stroke="#999"/><text x="472" y="40">5. PKI tar</text><text x="472" y="56">pki-DATE.tgz</text>
+  <rect x="575" y="20" width="100" height="50" rx="4" fill="#f3f5f7" stroke="#999"/><text x="582" y="40">6. prune</text><text x="582" y="56">keep newest 28</text>
+  <line x1="105" y1="45" x2="118" y2="45" stroke="#1f2328" marker-end="url(#b)"/><line x1="220" y1="45" x2="233" y2="45" stroke="#1f2328" marker-end="url(#b)"/><line x1="335" y1="45" x2="348" y2="45" stroke="#1f2328" marker-end="url(#b)"/><line x1="450" y1="45" x2="463" y2="45" stroke="#1f2328" marker-end="url(#b)"/><line x1="560" y1="45" x2="573" y2="45" stroke="#1f2328" marker-end="url(#b)"/>
+ </g>
+</svg>
+<div class="box warn"><span class="label">Why verify before renaming?</span>
+Pruning keeps "the newest 28 <code>.db</code> files". If damaged snapshots also got the <code>.db</code> name, a week of silent failures would push <b>every good snapshot</b> out, and you'd only find out on restore day. So only a verified file gets the final name.</div>
+<h3>4.2 Why a systemd timer, not cron or a CronJob?</h3>
+<ul>
+<li><b>vs cron:</b> <code>Persistent=true</code> catches up on runs missed while the VM was off; output goes to the journal; <code>systemctl list-timers</code> shows the last and next run.</li>
+<li><b>vs a Kubernetes CronJob:</b> a backup of the cluster must not depend on the cluster. The day the scheduler or API server is broken is the day you need the backup.</li>
+</ul>
+<pre>sudo systemctl start etcd-backup.service            # run once by hand first
+sudo journalctl -u etcd-backup -n 30 --no-pager     # status table + "OK: ..."
+systemctl list-timers etcd-backup.timer --no-pager  # next run</pre>
+
+<h2 class="pb">5. How to restore</h2>
+<svg width="680" height="175" viewBox="0 0 680 175" role="img" aria-label="Restore flow">
+ <defs><marker id="c" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f2328"/></marker></defs>
+ <g font-family="Segoe UI, Arial" font-size="10.5">
+  <rect x="5" y="10" width="140" height="44" rx="4" fill="#f3f5f7" stroke="#999"/><text x="12" y="28" font-weight="700">snapshot file</text><text x="12" y="44">etcd-…-1658.db</text>
+  <rect x="190" y="10" width="170" height="44" rx="4" fill="#eaf7ee" stroke="#2e8b57"/><text x="197" y="28" font-weight="700">A. restore into NEW folder</text><text x="197" y="44">/var/lib/etcd-restore</text>
+  <rect x="400" y="10" width="270" height="44" rx="4" fill="#fdecea" stroke="#c62828"/><text x="407" y="28" font-weight="700">B. stop control plane</text><text x="407" y="44">move 4 manifests out → pods stop</text>
+  <rect x="400" y="75" width="270" height="44" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="407" y="93" font-weight="700">C. swap folders</text><text x="407" y="109">etcd → etcd.before-drill · etcd-restore → etcd</text>
+  <rect x="190" y="75" width="170" height="44" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="197" y="93" font-weight="700">D. start again</text><text x="197" y="109">manifests back, restart kubelet</text>
+  <rect x="5" y="75" width="140" height="44" rx="4" fill="#eaf7ee" stroke="#2e8b57"/><text x="12" y="93" font-weight="700">E. verify</text><text x="12" y="109">"drill" namespace gone?</text>
+  <line x1="145" y1="32" x2="188" y2="32" stroke="#1f2328" marker-end="url(#c)"/><line x1="360" y1="32" x2="398" y2="32" stroke="#1f2328" marker-end="url(#c)"/>
+  <line x1="535" y1="54" x2="535" y2="73" stroke="#1f2328" marker-end="url(#c)"/><line x1="400" y1="97" x2="362" y2="97" stroke="#1f2328" marker-end="url(#c)"/><line x1="190" y1="97" x2="147" y2="97" stroke="#1f2328" marker-end="url(#c)"/>
+  <text x="400" y="145" fill="#c62828">API server is DOWN from B to D (kubectl fails: expected)</text>
+  <text x="5" y="165" fill="#57606a">The drill: snapshot at 16:58 → create namespace "drill" → restore 16:58 → "drill" must be gone</text>
+ </g>
+</svg>
+<h3>Step 0: read the member's identity (never guess)</h3>
+<pre>sudo grep -E -- '--(name|data-dir|initial-cluster|initial-advertise-peer-urls)=' /etc/kubernetes/manifests/etcd.yaml
+sudo grep -B1 -A2 'path: /var/lib/etcd' /etc/kubernetes/manifests/etcd.yaml</pre>
+<p>A restore creates a <b>brand-new database</b> that records <b>who its member is</b>. That identity must match what the etcd pod says about itself; otherwise etcdutl uses its defaults (<code>default</code> at <code>http://localhost:2380</code>) and etcd breaks.</p>
+<table>
+<tr><th>Flag</th><th>Plain meaning</th><th>Ours</th></tr>
+<tr><td><code>--name</code></td><td>"My name is…"</td><td>cka-m</td></tr>
+<tr><td><code>--initial-advertise-peer-urls</code></td><td>"Other members reach me at…"</td><td>https://10.0.0.100:2380</td></tr>
+<tr><td><code>--initial-cluster</code></td><td>"The cluster consists of…"</td><td>cka-m=https://10.0.0.100:2380</td></tr>
+<tr><td><code>--data-dir</code></td><td>Folder <b>inside the container</b></td><td>/var/lib/etcd</td></tr>
+<tr><td><code>hostPath.path</code></td><td>Folder <b>on the node's disk</b>: this is what we swap</td><td>/var/lib/etcd</td></tr>
+</table>
+<h3>Step A: restore into a new folder (the live cluster isn't touched)</h3>
+<pre>sudo etcdutl snapshot restore /var/backups/etcd/etcd-2026-09-24-1658.db \
+  --data-dir=/var/lib/etcd-restore --name=cka-m \
+  --initial-cluster=cka-m=https://10.0.0.100:2380 \
+  --initial-advertise-peer-urls=https://10.0.0.100:2380 \
+  --bump-revision=1000000000 --mark-compacted
+# log: bumping latest revision 12718 → 1000012718; marking revision compacted</pre>
+<div class="box"><span class="label"><code>--bump-revision</code> and <code>--mark-compacted</code> in plain words</span>
+Every controller remembers "the last change number I saw". The live cluster had moved past the snapshot's number. If the restored etcd started <i>lower</i>, controllers would think nothing changed and keep stale data in memory. Jumping the counter far ahead and marking old history as gone forces every controller to reload fresh data.</div>
+<h3>Steps B–D: stop, swap, start</h3>
+<pre># B. stop ALL four static pods (they keep cluster state in memory)
+sudo mkdir /etc/kubernetes/manifests-stopped
+sudo mv /etc/kubernetes/manifests/*.yaml /etc/kubernetes/manifests-stopped/
+sudo crictl ps --name '^(etcd|kube-apiserver|kube-controller-manager|kube-scheduler)$'   # repeat until empty
+# C. swap (keep the old folder: it's your way back)
+sudo mv /var/lib/etcd /var/lib/etcd.before-drill
+sudo mv /var/lib/etcd-restore /var/lib/etcd
+# D. start again
+sudo mv /etc/kubernetes/manifests-stopped/*.yaml /etc/kubernetes/manifests/
+sudo rmdir /etc/kubernetes/manifests-stopped
+sudo systemctl restart kubelet</pre>
+<div class="box warn"><span class="label">Why swap folders instead of editing etcd.yaml?</span>
+The common exam shortcut is to point <code>hostPath</code> at <code>/var/lib/etcd-restore</code>. It works today, but a later <code>kubeadm upgrade</code> regenerates etcd.yaml with <code>/var/lib/etcd</code>, and would silently switch you back to the <b>old</b> data. Swapping keeps the manifest exactly as kubeadm made it. Know both methods.</div>
+<p><b>Rollback</b> if the API server isn't back within 5 minutes: repeat B, move the restored folder aside, move <code>etcd.before-drill</code> back to <code>/var/lib/etcd</code>, repeat D. Don't try random fixes on a cluster that's down.</p>
+
+<h2 class="pb">6. How to validate a restore</h2>
+<table>
+<tr><th>#</th><th>Check</th><th>Command</th><th>What we saw</th></tr>
+<tr><td>1</td><td>Control plane back, no crash loops</td><td><code>sudo crictl ps --name '^(etcd|kube-…)$'</code></td><td>All 4 Running, attempt 0</td></tr>
+<tr><td>2</td><td><b>The proof</b>: the change made after the snapshot is gone</td><td><code>kubectl get ns</code></td><td><code>drill</code> missing ✅</td></tr>
+<tr><td>3</td><td>Nodes and pods healthy</td><td><code>kubectl get nodes</code>, <code>get pods -A</code></td><td>3 Ready, all Running</td></tr>
+<tr><td>4</td><td>etcd healthy, right identity</td><td><code>etcdctl … endpoint status -w table</code></td><td>Member ID 99c2fd4fe11e28d9 = the ID the restore wrote</td></tr>
+<tr><td>5</td><td>Writes work</td><td><code>kubectl create ns write-test &amp;&amp; kubectl delete ns write-test</code></td><td>OK</td></tr>
+<tr><td>6</td><td>Backups work on the restored etcd</td><td><code>systemctl start etcd-backup.service</code></td><td>Revision 1000013198: the bump is live</td></tr>
+<tr><td>7</td><td>Remote clients still trusted</td><td>Windows: <code>kubectl get nodes</code></td><td>3 Ready</td></tr>
+<tr><td>8</td><td><b>Only then</b> clean up</td><td><code>sudo rm -rf /var/lib/etcd.before-drill</code></td><td>It holds every Secret</td></tr>
+</table>
+<p class="small">Our honest slip: the old folder was deleted before check 7 had run. The risk was small (the PKI never changed), but the rule is: <b>the rollback copy is the last thing you delete</b>.</p>
+<p><b>Other things we noticed:</b> <code>calico-kube-controllers</code> restarted once (it lost the API server during the swap), which is expected. The DB was 4.4 MB with only 1.9 MB in use, because <code>--mark-compacted</code> freed history; <code>etcdctl defrag</code> would give the space back.</p>
+<div class="box warn"><span class="label">Real-world caution</span>
+A restore rolls back <b>everything</b> after the snapshot, not only your mistake. Pods created later become unknown to Kubernetes, and IP allocations can clash. Restore for disasters, using the newest good snapshot.</div>
+
+<h2>7. Common mistakes</h2>
+<table>
+<tr><th>Mistake</th><th>What happens</th></tr>
+<tr><td>Backups only on the control-plane node</td><td>They die with the node</td></tr>
+<tr><td>Snapshot saved without the PKI</td><td>A rebuilt node gets a new CA, and nothing trusts anything</td></tr>
+<tr><td>Restore without <code>--name</code>/<code>--initial-cluster</code>/peer URL</td><td>Member identity mismatch; etcd fails or records a wrong member</td></tr>
+<tr><td>Restoring on top of the existing <code>/var/lib/etcd</code></td><td>etcdutl refuses (data dir exists), or you destroy your way back</td></tr>
+<tr><td>API server left running during the swap</td><td>Stale cached data, or writes into the wrong database</td></tr>
+<tr><td>Backup files readable by everyone</td><td>Anyone on the node reads every Secret and the CA key</td></tr>
+<tr><td><code>etcdctl snapshot restore</code> on 3.6</td><td>Removed: use <code>etcdutl</code></td></tr>
+<tr><td>Never testing a restore</td><td>You find out on the worst day that it doesn't work</td></tr>
+</table>
+
+<h2 class="pb">8. Quiz</h2>
+<ol class="quiz">
+<li>What does etcd store, and name two important things it does NOT store.</li>
+<li>Why is a snapshot file as sensitive as all your passwords?</li>
+<li>Why do we back up <code>/etc/kubernetes/pki</code> together with the snapshot?</li>
+<li>If cka-m died and you rebuilt it, when exactly do you put the PKI back, and why?</li>
+<li>Our backups live in <code>/var/backups/etcd</code> on cka-m. Name two failures they won't survive.</li>
+<li>What's the 3-2-1 rule?</li>
+<li>Why does the script verify the snapshot before renaming it from <code>.tmp</code> to <code>.db</code>? Link your answer to pruning.</li>
+<li>Why a systemd timer and not a Kubernetes CronJob?</li>
+<li>What does <code>Persistent=true</code> do, and why does it matter in our lab?</li>
+<li>Which tool takes the snapshot, and which tool checks and restores it, in etcd 3.6?</li>
+<li>What does the REVISION number mean, and why did ours grow with nothing deployed?</li>
+<li>Why must a restore get <code>--name</code>, <code>--initial-cluster</code> and <code>--initial-advertise-peer-urls</code>?</li>
+<li>What's the difference between <code>--data-dir</code> and the <code>hostPath</code> in etcd.yaml?</li>
+<li>Explain <code>--bump-revision</code> and <code>--mark-compacted</code> in plain words.</li>
+<li>Why stop all four static pods, not only etcd?</li>
+<li>Why swap folders instead of pointing hostPath at the restore folder?</li>
+<li>How did we <i>prove</i> the restore worked?</li>
+<li>When may you delete <code>/var/lib/etcd.before-drill</code>, and why delete it at all?</li>
+</ol>
+
+<h2 class="pb">Answer key</h2>
+<ol class="answers">
+<li>All API objects (incl. Secrets, RBAC, CRDs, Nodes). Not: data inside PersistentVolumes, container images, the PKI files.</li>
+<li>Secrets are stored only base64-encoded (unless encryption at rest is enabled), so the snapshot contains them in readable form.</li>
+<li>The snapshot is the data; the PKI is the identity. Without the original CA, a rebuilt control plane isn't trusted by nodes and clients.</li>
+<li><b>Before</b> <code>kubeadm init</code>: kubeadm reuses existing certificates, so the cluster keeps its CA and everyone still trusts it.</li>
+<li>E.g. the VM disk dies or is corrupted; the VM is deleted or reinstalled; an accidental <code>rm -rf</code> or ransomware on the node.</li>
+<li>3 copies, on 2 different media, 1 of them off-site.</li>
+<li>Pruning keeps only the newest 28 <code>.db</code> files. If corrupt snapshots were named <code>.db</code>, a run of failures would push the last good ones out of retention.</li>
+<li>A backup of the cluster must not depend on the cluster's own scheduler and API server being healthy.</li>
+<li>It runs a missed scheduled run as soon as the machine boots. Our VMs are often off at 00/06/12/18 h.</li>
+<li><code>etcdctl snapshot save</code> takes it; <code>etcdutl snapshot status</code> / <code>restore</code> check and restore it.</li>
+<li>etcd's global change counter: every write adds 1. Node heartbeats (every ~10 s), status updates and events keep writing.</li>
+<li>The restore writes a new member list. The identity must match the etcd pod's flags, or etcd fails or records a wrong member (defaults are <code>default</code> / localhost).</li>
+<li><code>--data-dir</code> is the path inside the container; <code>hostPath</code> is the folder on the node's disk mounted there, which is what you swap.</li>
+<li>Controllers remember the last revision they saw, which is higher than the snapshot's. Jumping the counter ahead and marking history compacted forces them to reload everything instead of trusting stale caches.</li>
+<li>The API server, controller-manager and scheduler keep cluster state in memory; they must restart to reload it from the restored etcd.</li>
+<li>So etcd.yaml stays identical to what kubeadm generated; a later <code>kubeadm upgrade</code> would otherwise switch back to <code>/var/lib/etcd</code>, the old data.</li>
+<li>We created namespace <code>drill</code> after the snapshot; after the restore it was gone. Plus: member ID matched, writes worked, a new backup succeeded, Windows kubectl worked.</li>
+<li>Only after every check has passed. Delete it because it contains a full copy of the cluster, including every Secret.</li>
+</ol>
+</body></html>

@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Phase 1 Requirements</title>
+<link rel="stylesheet" href="study.css"></head><body>
+
+<section class="cover">
+  <div class="kicker">Phase 1 · Study notes 5 of 5 · in progress</div>
+  <h1>Requirements Before YAML</h1>
+  <div class="sub">How an architect turns a client's wishes into numbers and decisions:<br>features, order lifecycle, load math, availability, RPO/RTO, data protection and access</div>
+  <div class="box"><span class="label">The core idea</span>
+  Beginners start with YAML. Architects start with <b>questions</b>. Every Kubernetes object we use later should exist because a <b>requirement</b> needs it. In an interview, "why did you use X?" should always have an answer that starts with a requirement.</div>
+  <h3>Contents</h3>
+  <ol>
+    <li>From requirement to Kubernetes object</li>
+    <li>Functional requirements: roles, features, order lifecycle</li>
+    <li>Architect's pushback: the decisions and why</li>
+    <li>Non-functional 1: load (requests per second, step by step)</li>
+    <li>Non-functional 2: availability (the nines, in minutes)</li>
+    <li>Non-functional 3: RPO, RTO and the business case</li>
+    <li>Security 1: protecting data</li>
+    <li>Security 2: who may access the cluster</li>
+    <li>What's still open</li>
+    <li>Quiz and answer key</li>
+  </ol>
+  <div class="meta">Decisions recorded in docs/00-project-charter.md §6 · 2026-09-25 · companion: docs/guides/high-availability-99.99.pdf</div>
+</section>
+
+<h2 class="pb">1. From requirement to Kubernetes object</h2>
+<table>
+<tr><th>The client says…</th><th>So we need…</th><th>Kubernetes object</th></tr>
+<tr><td>"Admins upload menu photos"</td><td>Storage that several pods share</td><td>PV / PVC with <b>ReadWriteMany</b> (NFS)</td></tr>
+<tr><td>"Daily sales report overnight"</td><td>A job on a schedule</td><td><b>CronJob</b></td></tr>
+<tr><td>"Checkout must not fail when SMS is down"</td><td>An asynchronous queue</td><td>Redis Streams + a worker Deployment with no Service</td></tr>
+<tr><td>"Nobody outside may call the discount service"</td><td>Network isolation</td><td>ClusterIP, no route + <b>NetworkPolicy</b></td></tr>
+<tr><td>"Updates without downtime"</td><td>Gradual replacement of pods</td><td>Deployment rolling update, readiness probes, <b>PDB</b></td></tr>
+</table>
+
+<h2>2. Functional requirements</h2>
+<h3>2.1 Roles</h3>
+<table>
+<tr><th>Role</th><th>Who</th><th>Can do</th></tr>
+<tr><td>Customer</td><td>Anyone who signs up</td><td>Browse, order, cancel, see own orders</td></tr>
+<tr><td>Staff</td><td>Counter staff</td><td>Accept/reject orders, move them through the lifecycle</td></tr>
+<tr><td>Admin</td><td>Shop owner</td><td>Everything staff can do + menu, availability, coupons, reports</td></tr>
+</table>
+<h3>2.2 Features</h3>
+<table>
+<tr><th>#</th><th>Feature</th><th>Who</th><th>Leads to</th></tr>
+<tr><td>F1</td><td>Browse the menu without logging in</td><td>Customer</td><td>menu-service (public), Redis cache</td></tr>
+<tr><td>F2</td><td>Sign up / log in, opt-in checkbox for offers (off by default)</td><td>Customer</td><td>auth-service, JWT, Secret</td></tr>
+<tr><td>F3</td><td>Place an order: login required, pickup only</td><td>Customer</td><td>order-service → discount-service (sync)</td></tr>
+<tr><td>F4</td><td>Apply a coupon</td><td>Customer</td><td>discount-service, internal only</td></tr>
+<tr><td>F5</td><td>Order history and live status</td><td>Customer</td><td>Postgres StatefulSet + PVC</td></tr>
+<tr><td>F6</td><td>"Accepted / rejected / ready" message (fake SMS in logs)</td><td>Customer</td><td>notification worker via Redis Streams</td></tr>
+<tr><td>F7</td><td>Add/edit menu items, upload photos</td><td>Admin</td><td>PVC ReadWriteMany</td></tr>
+<tr><td>F8</td><td>Create coupons</td><td>Admin</td><td>discount-service</td></tr>
+<tr><td>F9</td><td>Daily sales report</td><td>Admin</td><td>CronJob</td></tr>
+<tr><td>F10</td><td>Expire old coupons nightly</td><td>System</td><td>CronJob</td></tr>
+<tr><td>F11</td><td>Shop open/closed, items in/out of stock; unavailable items can't be ordered</td><td>Admin</td><td>menu-service; order-service validates</td></tr>
+<tr><td>F12</td><td>Accept or reject orders (reason + suggestion text)</td><td>Staff</td><td>order-service</td></tr>
+<tr><td>F13</td><td>Orders with no response in 10 min become EXPIRED</td><td>System</td><td>CronJob</td></tr>
+</table>
+<h3>2.3 The order lifecycle</h3>
+<svg width="680" height="200" viewBox="0 0 680 200" role="img" aria-label="Order lifecycle">
+ <defs><marker id="m" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f2328"/></marker></defs>
+ <g font-family="Segoe UI, Arial" font-size="11">
+  <rect x="10" y="20" width="95" height="36" rx="18" fill="#eef5fc" stroke="#0b5cad"/><text x="30" y="43" font-weight="700">PLACED</text>
+  <rect x="175" y="20" width="110" height="36" rx="18" fill="#fff4e5" stroke="#e69500"/><text x="190" y="43" font-weight="700">PREPARING</text>
+  <rect x="355" y="20" width="95" height="36" rx="18" fill="#fff4e5" stroke="#e69500"/><text x="380" y="43" font-weight="700">READY</text>
+  <rect x="520" y="20" width="140" height="36" rx="18" fill="#eaf7ee" stroke="#2e8b57"/><text x="540" y="43" font-weight="700">COMPLETED</text>
+  <line x1="105" y1="38" x2="173" y2="38" stroke="#1f2328" marker-end="url(#m)"/><text x="108" y="30" font-size="9.5">staff accepts</text>
+  <line x1="285" y1="38" x2="353" y2="38" stroke="#1f2328" marker-end="url(#m)"/>
+  <line x1="450" y1="38" x2="518" y2="38" stroke="#1f2328" marker-end="url(#m)"/><text x="455" y="30" font-size="9.5">collected</text>
+  <rect x="175" y="95" width="110" height="36" rx="18" fill="#fdecea" stroke="#c62828"/><text x="193" y="118" font-weight="700">REJECTED</text>
+  <rect x="175" y="145" width="110" height="36" rx="18" fill="#f3f5f7" stroke="#999"/><text x="190" y="168" font-weight="700">CANCELLED</text>
+  <rect x="355" y="145" width="95" height="36" rx="18" fill="#f3f5f7" stroke="#999"/><text x="370" y="168" font-weight="700">EXPIRED</text>
+  <path d="M57,56 L57,113 L173,113" fill="none" stroke="#c62828" marker-end="url(#m)"/><text x="62" y="108" font-size="9.5" fill="#c62828">staff rejects + reason</text>
+  <path d="M40,56 L40,163 L173,163" fill="none" stroke="#1f2328" marker-end="url(#m)"/><text x="45" y="158" font-size="9.5">customer cancels</text>
+  <path d="M75,56 L75,85 L402,85 L402,143" fill="none" stroke="#1f2328" stroke-dasharray="4 3" marker-end="url(#m)"/><text x="300" y="80" font-size="9.5">no response in 10 min</text>
+ </g>
+</svg>
+<p>Only a <code>PLACED</code> order can be cancelled by the customer, rejected, or expired. Rejection reasons: <code>CLOSED</code>, <code>OUT_OF_STOCK</code>, <code>OTHER</code>, plus a suggestion text ("no masala chai today, try ginger chai!"). Customers pay at the counter on pickup.</p>
+
+<h2 class="pb">3. Architect's pushback: the decisions and why</h2>
+<table>
+<tr><th>Client wanted</th><th>Architect's response</th><th>Decision</th></tr>
+<tr><td>Reject orders when closed or out of stock</td><td>Rejecting an order the customer already placed is a bad experience. <b>Prevent it</b> instead: show open/closed and stock on the menu</td><td>F11 added; REJECTED kept for surprises (the last milk ran out)</td></tr>
+<tr><td>Offer a substitute ("we don't have X, want Y?")</td><td>A two-way negotiation needs a waiting state, notifications and timeouts, and teaches <b>no new Kubernetes object</b></td><td>Rejection with a suggestion text; full substitution is out of scope</td></tr>
+<tr><td>Login required (for contact details)</td><td>Agreed, and marketing messages need <b>consent</b> (India's DPDP Act 2023, GDPR)</td><td>Opt-in checkbox, off by default</td></tr>
+<tr><td>Delivery?</td><td>Adds addresses (more personal data), a delivery step, tracking</td><td>Pickup only for now</td></tr>
+<tr><td>(Unasked) What if staff never respond?</td><td>An order must not wait forever</td><td>EXPIRED after 10 min (F13)</td></tr>
+</table>
+<div class="box ok"><span class="label">Interview line</span>
+"I don't just take requirements; I challenge them. Where a rejection can be prevented, I prevent it. Where a feature adds complexity without matching value, I propose a simpler version. And every requirement is traced to the component that implements it."</div>
+
+<h2>4. Non-functional 1: load, step by step</h2>
+<h3>Piece 1: a request</h3>
+<p>Every time a browser asks the server for something, that's 1 request, like one customer walking up to the counter and asking something.</p>
+<h3>Piece 2: "50 users online" ≠ "50 requests now"</h3>
+<p>50 customers inside a chai shop aren't all talking to the counter at the same second. Most are reading, drinking, chatting. Online is the same: <b>concurrent</b> means the site is <i>open</i>, not that everyone is clicking.</p>
+<h3>Piece 3: one user</h3>
+<pre>1 user does something about once every 10 seconds
+→ 1 ÷ 10 = 0.1 requests per second</pre>
+<h3>Piece 4: fifty users</h3>
+<pre>50 users × 0.1 = 5 requests per second   (average)</pre>
+<h3>Piece 5: rush hour</h3>
+<pre>5 × 4 (safety factor for the 8–10 am and 5–7 pm rush) = 20 requests per second   ← design target</pre>
+<h3>Piece 6: is 20 a lot?</h3>
+<p>No. One small server answers <b>thousands</b> of simple requests per second. That's why the charter honestly says this app doesn't <i>need</i> Kubernetes. We use it to learn. In the Phase 10 load test we'll push far beyond 20 on purpose to watch HPA scale.</p>
+<div class="box"><span class="label">Where does most of the traffic come from?</span>
+Not browsing: <b>waiting</b>. A customer watching the status page checks every 5 s for ~5 minutes, which is ~60 requests. Knowing that, you could check less often or push updates to the browser instead.</div>
+<p class="small">Formula (Little's law style): requests/s ≈ users ÷ seconds between clicks. 200 users → 20 req/s average → 80 at rush hour.</p>
+
+<h2 class="pb">5. Non-functional 2: availability</h2>
+<h3>Piece 1: turn the percentage into minutes</h3>
+<pre>A month ≈ 30 days × 24 h = 720 hours
+
+99.5 %  → down 0.5 %  → 720 × 0.005  = 3.6 hours per month   ← our target
+99.9 %  → down 0.1 %  → 720 × 0.001  = 0.72 h ≈ 43 minutes
+99.99 % → down 0.01 % → 720 × 0.0001 = 0.072 h ≈ 4.3 minutes</pre>
+<h3>Piece 2: why not promise more?</h3>
+<p>We have <b>one</b> control plane, <b>one</b> Postgres and the NFS server on cka-m. If cka-m is down, running pods keep serving, but nothing can be changed, and anything using NFS stops. Promising 99.9% would be a lie; 99.5% is honest, and we'll measure it.</p>
+<h3>Piece 3: zero-downtime deploys are separate, and free</h3>
+<p>Planned updates must not take the site down. Kubernetes gives us this for free: rolling updates, readiness probes, PodDisruptionBudgets, at least 2 replicas of stateless services.</p>
+
+<h2>6. Non-functional 3: RPO, RTO and the business case</h2>
+<table>
+<tr><th>Term</th><th>Plain meaning</th><th>GaramChai</th></tr>
+<tr><td><b>RPO</b></td><td>How much data you may <b>lose</b>: the time since the last good copy (look back)</td><td><b>4 hours</b> → Postgres backup CronJob every 4 h</td></tr>
+<tr><td><b>RTO</b></td><td>How long recovery may <b>take</b> (look forward)</td><td>1 hour</td></tr>
+</table>
+<h3>The money math, piece by piece</h3>
+<pre>1 hour down at the evening rush:  50 orders × ₹100 = ₹5,000 lost
+99.5 % allows 3.6 h/month; worst case all at rush hour: 3.6 × ₹5,000 = ₹18,000/month
+99.99 % would need multi-site servers, a replicated database and a 24×7 on-call team:
+   one engineer's salary alone is more than ₹18,000/month, before a single server
+→ spending lakhs to save ₹18,000 is like a ₹10 lakh alarm for a ₹20,000 bicycle</pre>
+<table>
+<tr><th>Recommendation</th><th>Why</th><th>Cost</th></tr>
+<tr><td>99.5 % (count the hours that matter)</td><td>Downtime at 3 am costs ₹0</td><td>nothing extra</td></tr>
+<tr><td>Zero-downtime deploys</td><td>Updates shouldn't cause outages</td><td>free (built in)</td></tr>
+<tr><td>A tested backup</td><td>Lost <b>data</b> is worse than downtime</td><td>a CronJob + a drill</td></tr>
+<tr><td>Revisit when the business grows</td><td>20 shops → 1 hour down could cost ₹1 lakh</td><td>nothing now</td></tr>
+</table>
+<div class="box ok"><span class="label">The lesson</span>Availability is a <b>business</b> decision. Put two numbers side by side: what downtime <b>costs</b>, and what preventing it <b>costs</b>. Pick the level where the second is smaller. The full 99.99% treatment (SLA/SLO/SLI, MTTR, multi-region AWS, cost) is in <code>docs/guides/high-availability-99.99.pdf</code>.</div>
+<table>
+<tr><th>#</th><th>Requirement</th><th>Target</th></tr>
+<tr><td>N1</td><td>Load</td><td>50 concurrent users; ~5 req/s average, ~20 at peak</td></tr>
+<tr><td>N2</td><td>Availability</td><td>99.5 %; zero downtime during deploys</td></tr>
+<tr><td>N3</td><td>Speed</td><td>p95 &lt; 300 ms (95 of 100 requests faster than this)</td></tr>
+<tr><td>N4</td><td>Orders data</td><td>RPO 4 h, RTO 1 h, backups kept 7 days</td></tr>
+<tr><td>N5</td><td>Retention</td><td>Order history kept 1 year, then deleted</td></tr>
+</table>
+
+<h2 class="pb">7. Security 1: protecting data</h2>
+<h3>7.1 List the data and rank it</h3>
+<table>
+<tr><th>Data</th><th>If it leaks…</th></tr>
+<tr><td>Menu, prices</td><td>Nothing, it's public</td></tr>
+<tr><td>Orders</td><td>A little embarrassing</td></tr>
+<tr><td>Email + phone</td><td><b>Personal data</b>: spam, scams, legal trouble</td></tr>
+<tr><td>Passwords</td><td><b>Very bad</b>: people reuse them for bank and email</td></tr>
+<tr><td>Keys, DB passwords</td><td><b>Worst</b>: an attacker becomes the app</td></tr>
+</table>
+<h3>7.2 Passwords: store a fingerprint, not the password</h3>
+<pre>Sign-up: "chai@123" → bcrypt → "$2b$12$Kx9...f3"   ← only this is saved
+Login:   "chai@123" → bcrypt → same fingerprint?   → yes = correct password</pre>
+<ul>
+<li>A hash is <b>one-way</b>: a stolen hash can't be turned back into the password.</li>
+<li>But attackers can still <b>guess</b>: hash a million common passwords and compare. <b>bcrypt</b> defends by being <b>slow on purpose</b> and adding a random <b>salt</b> per user (same password → different hash).</li>
+</ul>
+<h3>7.3 A Secret isn't secret by default</h3>
+<ul>
+<li>A Kubernetes Secret is only <b>base64-encoded</b>: <code>echo cGFzc3dvcmQ= | base64 -d</code> gives <code>password</code> to anyone.</li>
+<li>It's readable by anyone with RBAC <code>get secrets</code>, and by anyone with access to <b>etcd or its backups</b>.</li>
+<li><b>Encryption at rest</b> (Phase 8) encrypts Secrets inside etcd with a <b>symmetric</b> key (e.g. AES): one key both encrypts and decrypts. Private/public key pairs (asymmetric) are a different thing, used in TLS certificates.</li>
+</ul>
+<table>
+<tr><th>#</th><th>Rule</th><th>Leads to</th></tr>
+<tr><td>S1</td><td>Passwords only as bcrypt hashes</td><td>auth-service code</td></tr>
+<tr><td>S2</td><td>Keys and DB passwords only in Secrets; only <code>*.example.yaml</code> in Git</td><td>Secret, <code>.gitignore</code></td></tr>
+<tr><td>S3</td><td>Encryption at rest for Secrets in etcd</td><td>EncryptionConfiguration (Phase 8)</td></tr>
+<tr><td>S4</td><td>One DB user per service; only auth-service reads personal data</td><td>Postgres roles (Phase 5)</td></tr>
+<tr><td>S5</td><td>TLS at the edge (browser → Traefik); inside, default-deny NetworkPolicy</td><td>Ingress/Gateway + cert-manager, NetworkPolicy</td></tr>
+</table>
+<p>Not chosen: mTLS between services everywhere. It needs a service mesh, which is too heavy for our RAM (common in banks and large shared clusters).</p>
+
+<h2 class="pb">8. Security 2: who may access the cluster</h2>
+<table>
+<tr><th>Step</th><th>Question</th><th>Failure</th></tr>
+<tr><td>Authentication</td><td>Who are you?</td><td>401</td></tr>
+<tr><td>Authorization (RBAC)</td><td>What may you do?</td><td>403</td></tr>
+</table>
+<p><b>Humans</b> are names in certificates (<code>CN</code> = name, <code>O</code> = group) signed by the cluster CA; there's no User object. <b>Programs</b> are ServiceAccount objects. Client certificates <b>can't be revoked</b>, so a stolen admin certificate works until it expires; that's why the CA key and admin.conf are guarded (details in study notes 1, §11).</p>
+<table>
+<tr><th>#</th><th>Who</th><th>Gets</th></tr>
+<tr><td>A1</td><td>Vishal (admin)</td><td>admin.conf: never shared, never committed</td></tr>
+<tr><td>A2</td><td>"intern" user</td><td>Read-only in <code>garamchai</code> only (CSR + Role/RoleBinding, Phase 8)</td></tr>
+<tr><td>A3</td><td>Each service</td><td>Own ServiceAccount, no API permissions, <code>automountServiceAccountToken: false</code></td></tr>
+<tr><td>A4</td><td>Backup Job</td><td>Small Role in <code>garamchai-data</code> only</td></tr>
+<tr><td>A5</td><td>SSH to nodes</td><td>Vishal only, key-based</td></tr>
+</table>
+<p><b>Deployments:</b> CI (GitHub Actions) only builds and pushes images; deploys run from the laptop. The cluster sits behind VMware NAT, so GitHub can't reach it, and opening it would put cluster credentials on a third-party server. The real-world alternative is <b>GitOps</b>: an agent inside the cluster (e.g. Argo CD) <i>pulls</i> from Git, so no credentials leave the cluster.</p>
+
+<h2>9. What's still open</h2>
+<ul>
+<li><b>Operations</b> section of the questionnaire: releases and rollback, logging, monitoring.</li>
+<li>Then: architecture document v1.0 and ADRs for new decisions → Phase 1 done.</li>
+<li>Before Phase 3: automatic pull of etcd backups to Windows (R10c-4).</li>
+</ul>
+
+<h2 class="pb">10. Quiz</h2>
+<ol class="quiz">
+<li>Why do architects start with requirements instead of YAML? Give one requirement → object example.</li>
+<li>Which three roles does GaramChai have, and what can staff do that customers can't?</li>
+<li>From which state can an order be cancelled by the customer? What happens if staff never respond?</li>
+<li>Why did we add F11 (open/closed, stock) instead of just rejecting orders?</li>
+<li>Why is item substitution out of scope?</li>
+<li>Why does the sign-up form need an opt-in checkbox?</li>
+<li>50 users each click once every 10 s. How many requests per second on average, and at rush hour (×4)?</li>
+<li>200 users, same behaviour: average and rush-hour requests per second?</li>
+<li>Which user activity causes the most requests, and why?</li>
+<li>How many hours per month of downtime does 99.5 % allow? Show the math.</li>
+<li>Why is 99.9 % not an honest promise for our lab?</li>
+<li>Define RPO and RTO in one line each. What's our RPO for orders, and what does it force us to build?</li>
+<li>The site is down for 2 hours at rush hour. How much is lost (₹5,000/hour)?</li>
+<li>Why is 99.99 % a bad deal for GaramChai? Use numbers.</li>
+<li>Why store a bcrypt hash instead of the password? What do slowness and salt add?</li>
+<li>Why is a Kubernetes Secret not truly secret by default? Who can read it?</li>
+<li>Does encryption at rest use a private key? Explain.</li>
+<li>Why TLS at the edge and not mTLS everywhere for us?</li>
+<li>Why do our services get no ServiceAccount token?</li>
+<li>Why don't we let GitHub Actions deploy to the cluster? What's the GitOps alternative?</li>
+</ol>
+
+<h2 class="pb">Answer key</h2>
+<ol class="answers">
+<li>Every object should exist because a requirement needs it; that's what makes design defensible. E.g. "admins upload photos" → ReadWriteMany PVC; "nightly report" → CronJob.</li>
+<li>Customer, staff, admin. Staff accept/reject orders and move them through PREPARING → READY → COMPLETED.</li>
+<li>Only while <code>PLACED</code>. With no staff response within 10 min it becomes <code>EXPIRED</code>.</li>
+<li>Prevention beats rejection: customers shouldn't be able to place orders that will be rejected. REJECTED stays for surprises.</li>
+<li>It needs a waiting state, notifications and timeouts (a negotiation workflow) and teaches no new Kubernetes object. A suggestion in the rejection message covers most of the value.</li>
+<li>Sending offers requires consent under India's DPDP Act 2023 (and GDPR); it's off by default.</li>
+<li>50 × 0.1 = 5 req/s average; × 4 = 20 req/s at rush hour.</li>
+<li>200 × 0.1 = 20 req/s average; 80 at rush hour.</li>
+<li>Waiting for READY: the status page checks every 5 s for about 5 minutes (~60 requests per order).</li>
+<li>720 h × 0.005 = 3.6 hours.</li>
+<li>Single control plane, single Postgres, NFS on cka-m: one machine failing takes parts of the app down for longer than 43 minutes.</li>
+<li>RPO: how much data you may lose (time since the last good copy). RTO: how long recovery may take. RPO 4 h → a Postgres backup CronJob every 4 hours (plus a restore drill).</li>
+<li>2 × ₹5,000 = ₹10,000.</li>
+<li>99.5 % worst case loses ~₹18,000/month; 99.99 % needs multi-site infrastructure and a 24×7 team costing lakhs per month. You'd spend far more than the downtime costs.</li>
+<li>A hash is one-way, so stolen hashes don't reveal passwords. Slowness makes mass guessing take years; a per-user salt makes identical passwords hash differently.</li>
+<li>It's only base64-encoded. Anyone with RBAC <code>get secrets</code>, or with access to etcd or its backups, can read it.</li>
+<li>No. It uses a symmetric key (e.g. AES) that both encrypts and decrypts. Private/public keys are asymmetric crypto, used for TLS.</li>
+<li>mTLS everywhere needs a service mesh, too heavy for our RAM. TLS at the edge + default-deny NetworkPolicy is proportionate.</li>
+<li>Our apps never call the Kubernetes API. Without a token, a hacked pod gives the attacker no cluster access (least privilege).</li>
+<li>GitHub can't reach a cluster behind NAT, and exposing it would put cluster credentials on a third-party server. GitOps: an in-cluster agent like Argo CD pulls changes from Git.</li>
+</ol>
+</body></html>

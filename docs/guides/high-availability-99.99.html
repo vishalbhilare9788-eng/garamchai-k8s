@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Designing for 99.99%</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm 18mm 15mm;
+          @bottom-center { content: "Designing for 99.99%  ·  page " counter(page); font: 8pt Arial, sans-serif; color: #888; } }
+  :root { --ink:#1f2328; --muted:#57606a; --line:#d0d7de; --accent:#0b5cad; --soft:#eef5fc; --warn:#fff4e5; --warnline:#e69500; --ok:#eaf7ee; --okline:#2e8b57; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: "Segoe UI", Arial, sans-serif; font-size: 10.3pt; line-height: 1.5; color: var(--ink); background: #fff; margin: 0; }
+  h1 { font-size: 22pt; color: var(--accent); margin: 0 0 4px; }
+  h2 { font-size: 15pt; color: var(--accent); border-bottom: 2px solid var(--accent); padding-bottom: 3px; margin: 22px 0 10px; break-after: avoid; }
+  h3 { font-size: 11.8pt; margin: 16px 0 6px; break-after: avoid; }
+  h4 { font-size: 10.5pt; margin: 12px 0 4px; color: var(--muted); break-after: avoid; }
+  p { margin: 5px 0 7px; }
+  table { border-collapse: collapse; width: 100%; margin: 6px 0 10px; font-size: 9.3pt; break-inside: avoid; }
+  th, td { border: 1px solid var(--line); padding: 4px 6px; vertical-align: top; text-align: left; }
+  th { background: #f3f5f7; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  code, pre { font-family: Consolas, "Courier New", monospace; font-size: 9.2pt; }
+  pre { background: #f6f8fa; border: 1px solid var(--line); border-radius: 4px; padding: 7px 9px; white-space: pre-wrap; break-inside: avoid; margin: 6px 0 9px; }
+  .box { border-left: 4px solid var(--accent); background: var(--soft); padding: 6px 10px; margin: 8px 0; break-inside: avoid; border-radius: 0 4px 4px 0; }
+  .warn { border-left-color: var(--warnline); background: var(--warn); }
+  .ok { border-left-color: var(--okline); background: var(--ok); }
+  .label { font-weight: 700; font-size: 8.6pt; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); display: block; margin-bottom: 2px; }
+  .cover { height: 250mm; display: flex; flex-direction: column; justify-content: center; }
+  .cover .sub { font-size: 13pt; color: var(--muted); margin-bottom: 22px; }
+  .cover .meta { font-size: 9.5pt; color: var(--muted); margin-top: 26px; }
+  .pb { break-before: page; }
+  ul, ol { margin: 4px 0 8px 20px; padding: 0; }
+  li { margin: 2px 0; }
+  .toc li { margin: 1px 0; }
+  .small { font-size: 8.8pt; color: var(--muted); }
+  svg { display: block; margin: 6px auto 10px; max-width: 100%; }
+  .two { display: flex; gap: 10px; } .two > div { flex: 1; }
+</style>
+</head>
+<body>
+
+<!-- ============================ COVER ============================ -->
+<section class="cover">
+  <h1>Designing for 99.99%</h1>
+  <div class="sub">Availability math, SLA / SLO / SLI, RPO / RTO, MTTR, disaster recovery and cost,<br>worked end to end on a financial app hosted on AWS</div>
+  <div class="box"><span class="label">How to read this guide</span>
+    Every idea comes in small pieces: <b>plain meaning → analogy → the math, step by step → what it means for the design → the one-line interview answer</b>.
+    Each part ends with a short self-check. Read one part per sitting; don't rush it.</div>
+  <h3>Contents</h3>
+  <ol class="toc">
+    <li>The example: <b>PayKaro</b>, a payments app on AWS</li>
+    <li>The vocabulary: availability, the "nines", SLI / SLO / SLA, error budget</li>
+    <li>The failure clock: MTBF, MTTD, MTTA, MTTR</li>
+    <li>Losing data vs. losing time: RPO and RTO</li>
+    <li>Availability math: chains (serial) and backups (parallel)</li>
+    <li>The questions an architect asks before saying "yes, 99.99%"</li>
+    <li>The design: PayKaro on AWS, layer by layer</li>
+    <li>Disaster-recovery strategies and which one fits</li>
+    <li>The cost: infrastructure, people, and the business case</li>
+    <li>Interview questions with model answers</li>
+    <li>Back to GaramChai: the same ideas in our Kubernetes lab</li>
+    <li>Glossary</li>
+  </ol>
+  <div class="meta">GaramChai K8s project · study guide · 2026-09-25<br>
+  AWS SLA figures checked against aws.amazon.com SLA pages in September 2026. Prices are rough list prices for illustration only; always confirm with the AWS Pricing Calculator.</div>
+</section>
+
+<!-- ============================ PART 1 ============================ -->
+<h2 class="pb">1. The example: PayKaro</h2>
+<p>We need one concrete app to hang every idea on. <b>PayKaro</b> (fictional) is an Indian payments app: customers pay shops by scanning a QR code, and the money moves from the customer's wallet to the merchant's.</p>
+
+<table>
+<tr><th>Fact about PayKaro</th><th>Value (our assumption)</th><th>Why it matters</th></tr>
+<tr><td>Transactions per day</td><td>5 million</td><td>Sizing (Part 5.5)</td></tr>
+<tr><td>Busiest hour</td><td>7–9 pm (shopping, dinner)</td><td>Downtime at this hour hurts most</td></tr>
+<tr><td>PayKaro earns per transaction</td><td>₹2 (fee)</td><td>Cost of downtime (Part 9)</td></tr>
+<tr><td>Client's demand</td><td><b>99.99% availability</b></td><td>The whole guide</td></tr>
+<tr><td>Where it runs</td><td>AWS, India</td><td>Indian rules on where payment data may be stored</td></tr>
+</table>
+
+<div class="box"><span class="label">Why a payments app?</span>
+Because it makes every trade-off sharp. For a chai shop (GaramChai) an outage is annoying. For a payments app an outage means shoppers standing at a counter unable to pay, merchants losing sales, a regulator asking questions and a brand losing trust. And a lost transaction isn't lost chai, it's lost money.</div>
+
+<!-- ============================ PART 2 ============================ -->
+<h2>2. The vocabulary</h2>
+
+<h3>2.1 Availability</h3>
+<p><b>Plain meaning:</b> the share of time the service works for its users.</p>
+<pre>Availability = time it worked ÷ total time
+
+Example: a 30-day month has 30 × 24 × 60 = 43,200 minutes.
+         The app was down for 43 minutes.
+         Availability = (43,200 − 43) ÷ 43,200 = 0.99900 = 99.90 %</pre>
+<p><b>Analogy:</b> a shop's opening hours. If the shop promises to be open all day and is shut for 43 minutes in a month, it was "open 99.9% of the time".</p>
+
+<h3>2.2 The "nines": turning a percentage into minutes</h3>
+<p>Percentages hide how small the numbers get. Always convert them into <b>minutes</b>, which is what the business actually feels.</p>
+<pre>Allowed downtime = total time × (100 % − availability)
+
+99.99 % over a 30-day month:
+   step 1: 100 % − 99.99 % = 0.01 %  = 0.0001
+   step 2: 43,200 minutes × 0.0001   = 4.32 minutes</pre>
+
+<table>
+<tr><th>Availability</th><th>"Nines"</th><th class="num">per year</th><th class="num">per 30-day month</th><th class="num">per week</th><th class="num">per day</th></tr>
+<tr><td>99 %</td><td>two</td><td class="num">3.65 days</td><td class="num">7.2 h</td><td class="num">1.7 h</td><td class="num">14.4 min</td></tr>
+<tr><td>99.5 %</td><td>two and a half</td><td class="num">1.83 days</td><td class="num">3.6 h</td><td class="num">50 min</td><td class="num">7.2 min</td></tr>
+<tr><td>99.9 %</td><td>three</td><td class="num">8.76 h</td><td class="num">43.2 min</td><td class="num">10.1 min</td><td class="num">1.4 min</td></tr>
+<tr><td>99.95 %</td><td>three and a half</td><td class="num">4.38 h</td><td class="num">21.6 min</td><td class="num">5.0 min</td><td class="num">43 s</td></tr>
+<tr><td><b>99.99 %</b></td><td><b>four</b></td><td class="num"><b>52.6 min</b></td><td class="num"><b>4.32 min</b></td><td class="num"><b>1.0 min</b></td><td class="num"><b>8.6 s</b></td></tr>
+<tr><td>99.999 %</td><td>five</td><td class="num">5.3 min</td><td class="num">26 s</td><td class="num">6 s</td><td class="num">0.9 s</td></tr>
+</table>
+<p class="small">Some sources use an average month of 30.44 days, so you'll also see "99% = 7.3 h per month". Both are fine; say which one you used.</p>
+
+<div class="box warn"><span class="label">The one fact that drives the whole design</span>
+At 99.99% you may be down for <b>4 minutes a month</b>. A human paged at 3 am needs longer than that just to wake up, read the alert and log in. So at four nines, <b>recovery must be automatic</b>. Humans find the root cause afterwards; machines restore service.</div>
+
+<h3>2.3 SLI, SLO, SLA: three words people mix up</h3>
+<p>Think of a pizza shop that promises "delivered in 30 minutes or it's free".</p>
+<table>
+<tr><th>Term</th><th>Plain meaning</th><th>Pizza analogy</th><th>PayKaro example</th></tr>
+<tr><td><b>SLI</b><br>Service Level <b>Indicator</b></td><td>A <b>measurement</b>: a number you compute from real data</td><td>"How many minutes did each delivery actually take?"</td><td>% of payment requests that succeeded within 1 second</td></tr>
+<tr><td><b>SLO</b><br>Service Level <b>Objective</b></td><td>An <b>internal target</b> for that measurement</td><td>"We aim for 99% of deliveries under 25 min"</td><td>99.99% of payments succeed within 1 s, over 30 days</td></tr>
+<tr><td><b>SLA</b><br>Service Level <b>Agreement</b></td><td>A <b>contract</b> with a customer, with a penalty if missed</td><td>"Over 30 min: the pizza is free"</td><td>To merchants: 99.95% per month, or a fee refund</td></tr>
+</table>
+
+<h4>How they fit together</h4>
+<pre>SLI  = what you MEASURE     (the speedometer)
+SLO  = what you AIM for     (your own speed rule: "I drive at 90")
+SLA  = what you PROMISE     (the legal limit: 100, with a fine)
+
+Rule: SLA is looser than SLO.  SLO 99.99 %  →  SLA 99.95 %
+      The gap is your safety margin: you notice and fix things
+      BEFORE you owe anybody money.</pre>
+
+<h4>A good SLI is measured the way the user feels it</h4>
+<pre>SLI (payments) = good payment requests ÷ all valid payment requests
+
+"good"  = answered without a server error (5xx) AND in under 1 second
+"valid" = excludes requests the user got wrong (bad PIN, bad QR) → those are 4xx</pre>
+<p>A payment that "succeeds" after 40 seconds has failed for the shopper at the counter, which is why slow counts as bad.</p>
+
+<div class="box warn"><span class="label">Trap: what cloud SLAs really promise</span>
+AWS SLAs don't guarantee uptime. They define <b>service credits</b>: if a service falls below a threshold, you get a partial refund of <i>that service's</i> bill. Example: Aurora Multi-AZ gives a 10% credit below 99.99%. If PayKaro loses ₹50 lakh in an outage, AWS refunds a slice of the database bill. <b>Your SLA to your customers is your problem, not AWS's.</b> An SLA is a financial instrument, not an engineering guarantee.</div>
+
+<h3>2.4 Error budget: turning the SLO into a spending allowance</h3>
+<p><b>Plain meaning:</b> if the target is 99.99%, then 0.01% of failure is <b>allowed</b>. That allowance is a budget you can "spend".</p>
+<pre>Time-based:     30 days × 0.01 %      = 4.32 minutes of downtime per month
+Request-based:  200 M payments × 0.01 % = 20,000 failed payments per month
+
+PayKaro: 5 M/day × 30 = 150 M/month  →  150 M × 0.0001 = 15,000 failures allowed</pre>
+<p><b>What it's for:</b> it ends the endless fight between "ship features fast" and "don't break anything".</p>
+<ul>
+<li>Budget left → ship features, run experiments, take risks.</li>
+<li>Budget spent → <b>freeze risky releases</b>; the team works on reliability until the budget recovers.</li>
+</ul>
+<h4>Burn rate: how fast you're spending it</h4>
+<pre>Burn rate 1  = spending exactly on plan (budget lasts the full 30 days)
+Burn rate 10 = spending 10× too fast   (whole budget gone in 30 ÷ 10 = 3 days)
+
+Alert rule used by many SRE teams (multi-window burn rate):
+  page a human if burn rate > 14.4 over the last 1 hour
+  (14.4 × 1 h = 2 % of a 30-day budget gone in one hour)</pre>
+
+<div class="box ok"><span class="label">Interview line</span>
+"SLIs are measurements from the user's point of view, SLOs are our internal targets, SLAs are contracts with penalties and are always looser than the SLO. The gap between 100% and the SLO is the error budget; when it's spent we slow releases and fix reliability."</div>
+
+<h4>Self-check</h4>
+<ol><li>How many minutes per 30-day month does 99.95% allow? (Answer: 43,200 × 0.0005 = 21.6.)</li>
+<li>Why should an SLA be looser than the SLO?</li>
+<li>A payment that succeeds after 30 seconds: good or bad for the SLI? Why?</li></ol>
+
+<!-- ============================ PART 3 ============================ -->
+<h2 class="pb">3. The failure clock: MTBF, MTTD, MTTA, MTTR</h2>
+<p>Every outage follows the same timeline. Each letter-soup term is just <b>one stretch of that timeline</b>.</p>
+
+<svg width="660" height="150" viewBox="0 0 660 150" role="img" aria-label="Incident timeline">
+  <line x1="20" y1="70" x2="640" y2="70" stroke="#1f2328" stroke-width="2"/>
+  <g font-family="Segoe UI, Arial" font-size="11" fill="#1f2328">
+    <circle cx="60" cy="70" r="5" fill="#2e8b57"/><text x="30" y="95">all good</text>
+    <circle cx="180" cy="70" r="6" fill="#c62828"/><text x="150" y="95">failure starts</text>
+    <circle cx="290" cy="70" r="5" fill="#e69500"/><text x="262" y="95">alert fires</text>
+    <circle cx="390" cy="70" r="5" fill="#e69500"/><text x="352" y="95">human responds</text>
+    <circle cx="560" cy="70" r="6" fill="#2e8b57"/><text x="520" y="95">service restored</text>
+  </g>
+  <g font-family="Segoe UI, Arial" font-size="11" font-weight="700">
+    <line x1="180" y1="40" x2="290" y2="40" stroke="#e69500" stroke-width="3"/><text x="205" y="33" fill="#b36b00">MTTD (detect)</text>
+    <line x1="290" y1="52" x2="390" y2="52" stroke="#8e44ad" stroke-width="3"/><text x="300" y="47" fill="#6c3483">MTTA (acknowledge)</text>
+    <line x1="180" y1="120" x2="560" y2="120" stroke="#c62828" stroke-width="3"/><text x="300" y="138" fill="#c62828">MTTR (the whole outage, as the user feels it)</text>
+    <line x1="60" y1="18" x2="180" y2="18" stroke="#2e8b57" stroke-width="3"/><text x="70" y="13" fill="#2e8b57">MTBF (time between failures)</text>
+  </g>
+</svg>
+
+<table>
+<tr><th>Term</th><th>Stands for</th><th>Plain meaning</th><th>How to make it better</th></tr>
+<tr><td><b>MTBF</b></td><td>Mean Time Between Failures</td><td>How long things usually work before the next failure. <b>Bigger is better.</b></td><td>Redundancy, testing, safer deploys, fewer risky changes</td></tr>
+<tr><td><b>MTTD</b></td><td>Mean Time To Detect</td><td>How long until anyone (or anything) notices</td><td>Good SLIs, synthetic checks every minute, burn-rate alerts</td></tr>
+<tr><td><b>MTTA</b></td><td>Mean Time To Acknowledge</td><td>How long until a human says "I'm on it"</td><td>On-call rotation, clear paging, no alert noise</td></tr>
+<tr><td><b>MTTR</b></td><td>Mean Time To <b>Recover</b> (also: Repair / Resolve)</td><td>From failure start to service working again. <b>Smaller is better.</b></td><td>Automatic failover, one-click rollback, runbooks</td></tr>
+</table>
+<p class="small">"MTTR" is ambiguous: Recover, Repair, Respond and Resolve are all used. In an interview, say which one you mean. For availability, the one that matters is time to <b>recover service</b>.</p>
+
+<h3>3.1 The formula that connects them</h3>
+<pre>Availability = MTBF ÷ (MTBF + MTTR)
+
+Plain words: of every "cycle" (working time + broken time), which share was working?</pre>
+
+<h3>3.2 Worked example: how fast must PayKaro recover?</h3>
+<pre>Suppose PayKaro has 1 incident per month.
+   MTBF ≈ 30 days = 43,200 minutes
+   Target availability = 99.99 %
+
+   0.9999 = 43,200 ÷ (43,200 + MTTR)
+   43,200 + MTTR = 43,200 ÷ 0.9999 = 43,204.32
+   MTTR = 4.32 minutes            ← the whole incident, detect-to-recovered</pre>
+
+<pre>Now the human reality of ONE incident:
+   detect (alert needs a few minutes of bad data)   2 min
+   page reaches a sleepy engineer, acknowledged      5 min
+   open laptop, VPN, dashboards, understand          10 min
+   decide and act (failover / rollback)              10 min
+   ------------------------------------------------------
+   total                                              27 min   ≈ 6× over budget</pre>
+
+<div class="box warn"><span class="label">Conclusion</span>
+With humans in the loop, one incident a month is enough to miss 99.99%. There are only two ways out, and a 99.99% design uses <b>both</b>:
+<ol><li><b>Recover automatically in seconds</b> (health checks + automatic failover + automatic rollback), so MTTR is small.</li>
+<li><b>Fail less often</b> (redundancy, safer deploys), so MTBF is big.</li></ol></div>
+
+<h4>Self-check</h4>
+<ol><li>If PayKaro had 4 incidents a month, how long could each one last at 99.99%? (Answer: 4.32 ÷ 4 ≈ 65 seconds.)</li>
+<li>Which of MTTD / MTTA / MTTR does automatic failover shrink?</li></ol>
+
+<!-- ============================ PART 4 ============================ -->
+<h2>4. Losing data vs. losing time: RPO and RTO</h2>
+<p>Availability asks "<b>is it up?</b>". Two more questions matter in a disaster: "<b>how much data did we lose?</b>" and "<b>how long until we're back?</b>"</p>
+
+<svg width="660" height="130" viewBox="0 0 660 130" role="img" aria-label="RPO and RTO timeline">
+  <line x1="20" y1="60" x2="640" y2="60" stroke="#1f2328" stroke-width="2"/>
+  <g font-family="Segoe UI, Arial" font-size="11" fill="#1f2328">
+    <rect x="150" y="50" width="8" height="20" fill="#2e8b57"/><text x="105" y="90">last good copy</text>
+    <rect x="330" y="46" width="10" height="28" fill="#c62828"/><text x="300" y="90">DISASTER</text>
+    <rect x="540" y="50" width="8" height="20" fill="#0b5cad"/><text x="505" y="90">back online</text>
+  </g>
+  <g font-family="Segoe UI, Arial" font-size="11.5" font-weight="700">
+    <line x1="154" y1="28" x2="335" y2="28" stroke="#c62828" stroke-width="3"/><text x="160" y="20" fill="#c62828">RPO: data you LOSE (look back)</text>
+    <line x1="335" y1="110" x2="544" y2="110" stroke="#0b5cad" stroke-width="3"/><text x="350" y="126" fill="#0b5cad">RTO: time you're DOWN (look forward)</text>
+  </g>
+</svg>
+
+<table>
+<tr><th>Term</th><th>Question it answers</th><th>Analogy: writing a document</th><th>PayKaro target</th></tr>
+<tr><td><b>RPO</b><br>Recovery Point Objective</td><td>How much recent data may we lose? (measured as <b>time</b>)</td><td>You last pressed "Save" 10 minutes ago, then the laptop died: RPO = 10 minutes of typing lost</td><td><b>≈ 0</b> for the ledger (a lost payment is lost money); minutes for analytics</td></tr>
+<tr><td><b>RTO</b><br>Recovery Time Objective</td><td>How long may recovery take?</td><td>How long until you're typing again on another laptop</td><td><b>&lt; 5 minutes</b> for payments</td></tr>
+</table>
+
+<h3>4.1 What decides RPO: how the copy is made</h3>
+<table>
+<tr><th>Copy method</th><th>How it works</th><th>RPO</th><th>Price</th></tr>
+<tr><td>Nightly backup</td><td>Copy once a day</td><td>up to 24 h</td><td>cheap</td></tr>
+<tr><td>Point-in-time recovery</td><td>Backup + continuous transaction log</td><td>about 5 min</td><td>cheap</td></tr>
+<tr><td><b>Asynchronous</b> replication</td><td>Primary says "saved" <b>first</b>, sends the copy a moment later</td><td>seconds (whatever was in flight)</td><td>medium; no slowdown</td></tr>
+<tr><td><b>Synchronous</b> replication</td><td>Primary says "saved" only <b>after</b> the copy confirms</td><td><b>0</b></td><td>every write waits for the other side, so it's slower the farther away the copy is</td></tr>
+</table>
+<div class="box"><span class="label">The physics you can't negotiate with</span>
+Synchronous copies inside one AWS region (between Availability Zones, a few km apart) cost about a millisecond per write, which is fine. Synchronous copies between <b>regions</b> hundreds of km apart add tens of milliseconds to <b>every</b> write. That's why the common pattern is <b>synchronous inside a region, asynchronous between regions</b>, and you design around the few seconds of cross-region RPO (Part 7.4).</div>
+
+<h3>4.2 Related terms you'll hear</h3>
+<ul>
+<li><b>MTD / MTPD</b> (Maximum Tolerable Downtime / Period of Disruption): the point where the business suffers serious damage. RTO must be comfortably below it.</li>
+<li><b>Durability vs. availability:</b> durability = "will my data still exist?"; availability = "can I reach it right now?". Amazon S3 Standard is designed for 99.999999999% (eleven nines) durability, but its availability is far lower (it's designed for 99.99%, and the SLA credit threshold is 99.9%). A service can be down while your data is perfectly safe.</li>
+<li><b>BCP vs. DR:</b> the Business Continuity Plan covers the whole business (people, offices, suppliers). Disaster Recovery is the IT part of it.</li>
+</ul>
+
+<div class="box ok"><span class="label">Interview line</span>
+"RPO is how much data we can afford to lose, looking back from the disaster; RTO is how long we can afford to be down, looking forward. RPO is decided by how we copy data: sync gives zero, async gives seconds, backups give hours. RTO is decided by how automated the recovery is."</div>
+
+<!-- ============================ PART 5 ============================ -->
+<h2 class="pb">5. Availability math: chains and backups</h2>
+
+<h3>5.1 Serial (a chain): every link must work</h3>
+<p><b>Analogy:</b> Christmas lights wired in a chain. One bulb fails, the whole string goes dark. A request that passes through a load balancer, then the app, then the database needs <b>all three</b>.</p>
+<pre>Rule: multiply the availabilities.
+
+Load balancer 99.99 %  ×  App 99.99 %  ×  Database 99.99 %
+   = 0.9999 × 0.9999 × 0.9999
+   = 0.9997
+   = 99.97 %          ← LOWER than every single part</pre>
+<div class="box warn"><span class="label">Key insight</span>
+A chain is always <b>weaker than its weakest link</b>. Every extra hop (another microservice, another external API) pulls the total down. Ten services at 99.9% in a chain give 0.999<super>10</super> ≈ 99.0%.</div>
+
+<h3>5.2 Parallel (backups): only one needs to work</h3>
+<p><b>Analogy:</b> two lamps in a room. The room is dark only if <b>both</b> fail at the same time.</p>
+<pre>Rule: availability = 1 − (chance that ALL copies are down)
+
+Two copies, each 99 % (each down 1 % of the time):
+   chance both down = 0.01 × 0.01 = 0.0001
+   availability     = 1 − 0.0001  = 0.9999 = 99.99 %
+
+Two copies, each 99.9 %:
+   both down = 0.001 × 0.001 = 0.000001  →  99.9999 %</pre>
+<p>This is the magic of redundancy: two "ordinary" things in parallel beat one excellent thing.</p>
+
+<div class="box warn"><span class="label">But: the two hidden assumptions</span>
+<ol><li><b>Independence.</b> The math assumes the copies fail <i>independently</i>. Two servers in the same rack, on the same power feed, running the same buggy release, fail <b>together</b>. That's why copies go in different Availability Zones (separate power, cooling, network) and different regions, and why a bad deploy is rolled out to one copy at a time.</li>
+<li><b>Instant failover.</b> The math assumes switching to the backup takes zero time. Real failover takes seconds to minutes, and <b>that switching time counts as downtime</b>. In practice MTTR of the failover, not the parallel formula, sets your real availability.</li></ol></div>
+
+<h3>5.3 Putting both together (the method)</h3>
+<ol><li>Draw the request path from the user to the data.</li>
+<li>Components one after another → <b>multiply</b>.</li>
+<li>Components that back each other up → <b>1 − (product of their unavailabilities)</b>.</li>
+<li>Subtract the realistic <b>failover time</b>.</li>
+<li>Compare with the target.</li></ol>
+
+<h3>5.4 Worked example: PayKaro in ONE AWS region</h3>
+<p>Using AWS's published SLA credit thresholds (checked September 2026) as conservative numbers:</p>
+<table>
+<tr><th>Component (Multi-AZ)</th><th class="num">SLA threshold</th></tr>
+<tr><td>Application Load Balancer (Multi-AZ)</td><td class="num">99.99 %</td></tr>
+<tr><td>EC2 instances across ≥ 2 AZs (EKS worker nodes; Region-Level SLA)</td><td class="num">99.99 %</td></tr>
+<tr><td>Aurora PostgreSQL, Multi-AZ cluster</td><td class="num">99.99 %</td></tr>
+</table>
+<pre>One region = 0.9999 × 0.9999 × 0.9999 = 0.9997 = 99.97 %
+           = 43,200 × 0.0003 ≈ 13 minutes down per month (on paper)
+Target 99.99 % = 4.3 minutes            →  ONE REGION DOESN'T MEET IT ON PAPER</pre>
+
+<div class="box"><span class="label">Two honest caveats</span>
+<ul><li><b>SLA numbers are pessimistic.</b> They're credit thresholds, not measured availability; real services usually do better. Composing SLAs gives a <b>conservative floor</b>, which is exactly what you want when you're signing a contract.</li>
+<li><b>The Kubernetes control plane isn't in the request path.</b> EKS's standard control plane SLA is 99.95%, but if the API server is down, the pods keep serving traffic; you just can't deploy or scale for a while. So it doesn't go into the chain for "can a customer pay?". It <i>does</i> matter for your MTTR, because you can't roll back without it. (EKS also offers a Provisioned Control Plane tier with a 99.99% SLA.)</li></ul></div>
+
+<h3>5.5 Worked example: PayKaro in TWO regions</h3>
+<pre>Each region: 99.97 %  →  unavailable 0.0003 of the time
+
+Both regions down at once (if independent):
+   0.0003 × 0.0003 = 0.00000009   →  availability 99.99999 %   (on paper)
+
+Reality check with failover time:
+   Assume a serious regional problem once a year, lasting 2 hours.
+   Single region:  120 min down  >  52.6 min yearly budget   →  SLO BROKEN for the whole year
+   Two regions, automatic failover in 5 min:
+                    5 min down    ≈ 10 % of the 52.6 min budget  →  SLO survives</pre>
+<div class="box ok"><span class="label">Conclusion for PayKaro</span>
+99.99% needs <b>at least two regions</b> with <b>automatic, practised failover</b>. Within each region, everything runs across <b>three Availability Zones</b>. That's the design in Part 7.</div>
+
+<h3>5.6 Sizing: how many transactions per second?</h3>
+<pre>5,000,000 transactions ÷ 86,400 seconds per day = 58 per second (average)
+Evening peak: assume 4 × average                = ~230 per second
+Design target with headroom                     = 300 per second</pre>
+<p>This is Little's-law style thinking again: average rate first, then a peak factor, then headroom.</p>
+
+<h4>Self-check</h4>
+<ol><li>Four services in a chain, each 99.9%. Total? (0.999<super>4</super> ≈ 99.6%)</li>
+<li>Two independent copies, each 99.5%. Total? (1 − 0.005 × 0.005 = 99.9975%)</li>
+<li>Why does "two copies in the same rack" break the parallel formula?</li></ol>
+
+<!-- ============================ PART 6 ============================ -->
+<h2 class="pb">6. The questions an architect asks before saying "yes, 99.99%"</h2>
+<p>The best first answer to "we need 99.99%" isn't "yes". It's a set of questions, because each extra nine costs roughly 10× more.</p>
+
+<h3>6.1 Business questions (always first)</h3>
+<table>
+<tr><th>Question</th><th>Why it matters</th><th>PayKaro answer (example)</th></tr>
+<tr><td>What does <b>1 hour of downtime cost</b>?</td><td>Sets how much reliability is worth paying for</td><td>≈ ₹16.6 lakh at peak, plus penalties and reputation (Part 9)</td></tr>
+<tr><td><b>Which user journeys</b> need 99.99%?</td><td>Not everything needs the same level</td><td>"Pay" and "check balance": 99.99%. Statements, offers, profile: 99.9%</td></tr>
+<tr><td><b>When</b>? 24×7 or business hours?</td><td>Changes the whole budget</td><td>24×7 (people pay at night too)</td></tr>
+<tr><td>Is planned maintenance downtime allowed?</td><td>If not, all changes must be zero-downtime</td><td>No</td></tr>
+<tr><td>What are the <b>RPO / RTO</b> per data type?</td><td>Drives replication choices</td><td>Ledger RPO ≈ 0, RTO &lt; 5 min</td></tr>
+<tr><td>Which <b>regulations</b> apply?</td><td>Can force where data lives and how DR is tested</td><td>Indian payment-data storage rules, PCI DSS if card data is handled (confirm with compliance)</td></tr>
+<tr><td>How will availability be <b>measured and reported</b>?</td><td>Avoids arguments later</td><td>Request-based SLI from the load balancer + synthetic checks</td></tr>
+</table>
+
+<h3>6.2 Technical questions</h3>
+<ul>
+<li><b>Single points of failure:</b> is there anything with only one copy? (one database writer, one NAT gateway, one DNS provider, one person who knows the system)</li>
+<li><b>Dependencies:</b> list every external service in the payment path (bank/UPI switch, SMS OTP, fraud check). What's <i>their</i> SLA? What does PayKaro do when one is down: fail, queue, or degrade?</li>
+<li><b>Data consistency:</b> can two regions accept writes for the same account? (For a ledger: usually <b>no</b>, because two regions both debiting the same wallet is how money gets double-spent.)</li>
+<li><b>Failure detection:</b> how fast do we know, and who decides to fail over: a machine or a person?</li>
+<li><b>Changes:</b> most outages are caused by our own deployments and configuration changes. How are they rolled out and rolled back?</li>
+<li><b>Capacity:</b> if one AZ (or one region) disappears, can the rest carry 100% of the load <i>immediately</i>?</li>
+</ul>
+
+<h3>6.3 People and process questions</h3>
+<ul>
+<li>Is there a <b>24×7 on-call rotation</b>? (Needs about 5–8 people so nobody is on call every week.)</li>
+<li>Are there <b>runbooks</b>, and have failovers been <b>practised</b> (game days)?</li>
+<li>Is there a <b>blameless post-incident review</b> after every outage?</li>
+<li>Who owns the <b>error budget</b> decision to freeze releases?</li>
+</ul>
+
+<!-- ============================ PART 7 ============================ -->
+<h2 class="pb">7. The design: PayKaro on AWS, layer by layer</h2>
+
+<svg width="680" height="330" viewBox="0 0 680 330" role="img" aria-label="PayKaro multi-region architecture">
+  <g font-family="Segoe UI, Arial" font-size="10.5">
+    <rect x="250" y="6" width="180" height="26" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="286" y="23">Users (app / QR scan)</text>
+    <rect x="200" y="44" width="280" height="26" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="212" y="61">Route 53 health checks + failover · CloudFront + WAF</text>
+    <line x1="340" y1="32" x2="340" y2="44" stroke="#1f2328"/>
+    <line x1="290" y1="70" x2="170" y2="92" stroke="#1f2328"/><line x1="390" y1="70" x2="510" y2="92" stroke="#1f2328" stroke-dasharray="4 3"/>
+    <!-- region A -->
+    <rect x="10" y="92" width="320" height="230" rx="6" fill="#fff" stroke="#2e8b57" stroke-width="2"/>
+    <text x="20" y="110" font-weight="700" fill="#2e8b57">Region A: Mumbai (primary, takes writes)</text>
+    <rect x="25" y="118" width="290" height="22" rx="3" fill="#f3f5f7" stroke="#999"/><text x="35" y="133">ALB across 3 AZs</text>
+    <rect x="25" y="148" width="90" height="70" rx="3" fill="#f3f5f7" stroke="#999"/><text x="33" y="163">AZ-a</text><text x="33" y="180">EKS pods</text><text x="33" y="196">(1/3 of load</text><text x="33" y="210">+ spare)</text>
+    <rect x="125" y="148" width="90" height="70" rx="3" fill="#f3f5f7" stroke="#999"/><text x="133" y="163">AZ-b</text><text x="133" y="180">EKS pods</text>
+    <rect x="225" y="148" width="90" height="70" rx="3" fill="#f3f5f7" stroke="#999"/><text x="233" y="163">AZ-c</text><text x="233" y="180">EKS pods</text>
+    <rect x="25" y="226" width="290" height="40" rx="3" fill="#eaf7ee" stroke="#2e8b57"/><text x="35" y="243">Aurora PostgreSQL writer + readers</text><text x="35" y="258">storage: 6 copies across 3 AZs (sync)</text>
+    <rect x="25" y="274" width="140" height="40" rx="3" fill="#f3f5f7" stroke="#999"/><text x="33" y="291">ElastiCache Multi-AZ</text><text x="33" y="306">SQS queues</text>
+    <rect x="175" y="274" width="140" height="40" rx="3" fill="#f3f5f7" stroke="#999"/><text x="183" y="291">KMS · Secrets Mgr</text><text x="183" y="306">AWS Backup vault</text>
+    <!-- region B -->
+    <rect x="350" y="92" width="320" height="230" rx="6" fill="#fff" stroke="#0b5cad" stroke-width="2" stroke-dasharray="6 3"/>
+    <text x="360" y="110" font-weight="700" fill="#0b5cad">Region B: Hyderabad (standby, ready to take over)</text>
+    <rect x="365" y="118" width="290" height="22" rx="3" fill="#f3f5f7" stroke="#999"/><text x="375" y="133">ALB across 3 AZs</text>
+    <rect x="365" y="148" width="290" height="70" rx="3" fill="#f3f5f7" stroke="#999"/><text x="375" y="165">EKS across 3 AZs: same release, running,</text><text x="375" y="181">scaled to take full load within minutes</text><text x="375" y="197">(serves reads / non-ledger traffic meanwhile)</text>
+    <rect x="365" y="226" width="290" height="40" rx="3" fill="#eef5fc" stroke="#0b5cad"/><text x="375" y="243">Aurora Global Database secondary (read-only)</text><text x="375" y="258">can be promoted to writer</text>
+    <rect x="365" y="274" width="290" height="40" rx="3" fill="#f3f5f7" stroke="#999"/><text x="375" y="291">Replicated secrets, multi-Region KMS keys,</text><text x="375" y="306">cross-region + cross-account backup copies</text>
+    <line x1="315" y1="246" x2="365" y2="246" stroke="#c62828" stroke-width="2"/><text x="318" y="240" fill="#c62828" font-size="9">async</text><text x="318" y="262" fill="#c62828" font-size="9">~1 s</text>
+  </g>
+</svg>
+
+<h3>7.1 Where the data lives (regions)</h3>
+<p>Two Indian regions: <b>Mumbai (ap-south-1)</b> as primary and <b>Hyderabad (ap-south-2)</b> as the second region. Keeping both in India matters because the Reserve Bank of India's 2018 directive requires payment-system data to be stored in India; always confirm the current rules with your compliance team.</p>
+
+<h3>7.2 Front door: DNS and edge</h3>
+<ul>
+<li><b>Route 53</b> with <b>health checks</b> and <b>failover routing</b>: if Mumbai's health check fails, DNS sends users to Hyderabad. Keep DNS TTLs short (for example 60 s) so clients follow quickly. (Route 53's SLA credit threshold is 100%: it's one of the most available services AWS has.)</li>
+<li><b>Route 53 Application Recovery Controller (ARC)</b>: routing controls you flip deliberately in a regional event, so failover is one reliable action instead of a guess.</li>
+<li><b>CloudFront + AWS WAF + Shield</b>: absorbs traffic spikes and attacks before they reach the app.</li>
+</ul>
+
+<h3>7.3 Compute: EKS across three Availability Zones</h3>
+<ul>
+<li>Every service runs <b>several replicas spread across 3 AZs</b> (Kubernetes <code>topologySpreadConstraints</code>).</li>
+<li><b>Static stability:</b> if one AZ disappears, the other two must carry 100% of the load <b>without waiting for autoscaling</b>. So each AZ runs at most about two-thirds full. That spare capacity is the price of not depending on "scale up during the emergency".</li>
+<li><b>Readiness probes</b> take a sick pod out of the load balancer in seconds; <b>liveness probes</b> restart hung ones; <b>PodDisruptionBudgets</b> stop maintenance from taking too many replicas down at once.</li>
+<li><b>HPA</b> (pods) and <b>Karpenter / Cluster Autoscaler</b> (nodes) for normal growth.</li>
+</ul>
+
+<h3>7.4 Data: the hardest part</h3>
+<ul>
+<li><b>Aurora PostgreSQL</b> in Mumbai: storage keeps <b>6 copies across 3 AZs</b>, and a write counts only when 4 of the 6 confirm. Losing a whole AZ loses <b>no committed data</b> (RPO 0 inside the region), and a reader is promoted to writer automatically.</li>
+<li><b>Aurora Global Database</b> copies to Hyderabad <b>asynchronously</b>. AWS states typical cross-region lag under 1 second, an RPO of about 1 second, and promotion of the secondary region in under 1 minute.</li>
+<li><b>One writer region at a time</b> for the ledger. Two regions writing the same wallet would risk double-spending, so the design is "active-active for reads, active-passive for writes".</li>
+<li><b>The ~1 second gap on regional failover:</b> a few in-flight payments may not have reached Hyderabad. The mitigations:
+  <ul><li><b>Idempotency keys:</b> every payment request carries a unique ID; retrying the same ID never charges twice.</li>
+  <li><b>Reconciliation:</b> after failover, compare with the bank/UPI switch's records and repair the few affected transactions.</li>
+  <li><b>Outbox pattern:</b> the ledger write and the "send notification" event are saved in one transaction, so events are never lost or invented.</li></ul></li>
+<li><b>Backups still matter</b>: replication faithfully copies mistakes too (a bad migration, a deleted table, ransomware). Use <b>point-in-time recovery</b> plus <b>AWS Backup</b> copies to another region <b>and another account</b>, with <b>Vault Lock</b> so nobody, including an attacker with admin rights, can delete them.</li>
+</ul>
+
+<h3>7.5 Resilience patterns in the code</h3>
+<table>
+<tr><th>Pattern</th><th>Plain meaning</th><th>Protects against</th></tr>
+<tr><td>Timeouts</td><td>Never wait forever for another service</td><td>One slow dependency freezing everything</td></tr>
+<tr><td>Retries with backoff + jitter</td><td>Try again, waiting a bit longer (and a bit random) each time</td><td>Short blips, without a retry storm</td></tr>
+<tr><td>Circuit breaker</td><td>After repeated failures, stop calling for a while and fail fast</td><td>Hammering a service that's already down</td></tr>
+<tr><td>Bulkheads</td><td>Separate pools per dependency, like watertight compartments in a ship</td><td>One bad dependency using up all threads/connections</td></tr>
+<tr><td>Graceful degradation</td><td>Turn off non-essential features, keep "Pay" working</td><td>Partial outages becoming total ones</td></tr>
+<tr><td>Load shedding</td><td>Politely reject excess requests instead of collapsing</td><td>Traffic spikes</td></tr>
+<tr><td>Cell-based architecture</td><td>Split users into independent "cells" (for example by merchant ID)</td><td>One failure or bad deploy reaching everyone ("blast radius")</td></tr>
+</table>
+
+<h3>7.6 Changes: where most outages come from</h3>
+<ul>
+<li><b>Canary releases</b>: send 1% → 10% → 50% → 100% of traffic to the new version, watching the SLIs at each step; <b>roll back automatically</b> if error rate or latency rises.</li>
+<li>Deploy <b>one region at a time</b> (and one cell at a time), never everywhere at once.</li>
+<li><b>Feature flags</b>: turn a feature off in seconds without a deploy.</li>
+<li>Database migrations in <b>backward-compatible steps</b> (expand → migrate → contract), so the old and new versions can run side by side.</li>
+</ul>
+
+<h3>7.7 Seeing problems: observability</h3>
+<ul>
+<li><b>The four golden signals</b> per service: latency, traffic, errors, saturation.</li>
+<li><b>Synthetic checks</b> (for example CloudWatch Synthetics) make a test payment path every minute from outside, so you learn about problems before customers do.</li>
+<li><b>SLO burn-rate alerts</b> (Part 2.4) instead of hundreds of noisy CPU alerts.</li>
+</ul>
+
+<h3>7.8 Practice: failures you rehearse don't surprise you</h3>
+<ul>
+<li><b>Game days</b>: planned regional failover drills (quarterly), with the real on-call team.</li>
+<li><b>Chaos engineering</b> with <b>AWS Fault Injection Service</b>: kill pods, stop an AZ's instances, add latency, and check that the SLO holds.</li>
+<li><b>Restore drills</b>: prove backups restore, just like our etcd drill in the GaramChai lab.</li>
+</ul>
+
+<!-- ============================ PART 8 ============================ -->
+<h2 class="pb">8. Disaster-recovery strategies and which one fits</h2>
+<p>AWS describes four classic strategies. Think of them as <b>how ready your second site is</b>.</p>
+<table>
+<tr><th>Strategy</th><th>What the second region has</th><th>Analogy</th><th>RPO</th><th>RTO</th><th>Cost</th></tr>
+<tr><td><b>Backup &amp; restore</b></td><td>Only backups. Build everything after the disaster</td><td>Spare keys at a friend's house, but no spare car</td><td>hours</td><td>hours to a day</td><td>$</td></tr>
+<tr><td><b>Pilot light</b></td><td>Data replicated; servers defined (IaC) but switched off</td><td>Gas stove with only the small pilot flame burning</td><td>seconds–minutes</td><td>tens of minutes</td><td>$$</td></tr>
+<tr><td><b>Warm standby</b></td><td>Data replicated; a <b>smaller</b> working copy running</td><td>A second shop open with one cook; call in more staff</td><td>seconds</td><td>minutes</td><td>$$$</td></tr>
+<tr><td><b>Multi-site active/active</b></td><td>Full copy running and serving traffic</td><td>Two full shops open, both serving customers</td><td>near 0</td><td>near 0</td><td>$$$$</td></tr>
+</table>
+<div class="box ok"><span class="label">Which fits PayKaro?</span>
+99.99% (4.3 min/month) rules out backup &amp; restore and pilot light: their RTO is longer than the whole monthly budget. The realistic choice is a <b>hot/warm standby that's already running and already scaled</b> (the Part 7 design), or full active/active for stateless and read traffic with a single write region for the ledger. RTO target: a few minutes, automated, practised.</div>
+
+<!-- ============================ PART 9 ============================ -->
+<h2>9. The cost</h2>
+<div class="box warn"><span class="label">Read this first</span>
+The numbers below are <b>rough, illustrative on-demand list prices</b> (approximately us-east-1, 2025–26; Mumbai differs a little), without discounts, data transfer or taxes. Their purpose is to show <b>proportions</b>, not to quote a price. For a real estimate use the AWS Pricing Calculator.</div>
+
+<h3>9.1 Infrastructure: three levels of ambition</h3>
+<table>
+<tr><th>Item (monthly, rough)</th><th class="num">A: 99.9%<br>1 region, 3 AZs</th><th class="num">B: 99.99%<br>+ warm standby region</th><th class="num">C: 99.99%+<br>active/active, full size</th></tr>
+<tr><td>EKS control plane(s) (~$73 each)</td><td class="num">$73</td><td class="num">$146</td><td class="num">$146</td></tr>
+<tr><td>Worker nodes (m6i.xlarge ≈ $140 each)</td><td class="num">6 → $840</td><td class="num">9 + 6 → $2,100</td><td class="num">9 + 9 → $2,520</td></tr>
+<tr><td>Aurora (r6g.large ≈ $190 each) + storage/I/O</td><td class="num">2 → $480</td><td class="num">2 + 1 → $770</td><td class="num">2 + 2 → $960</td></tr>
+<tr><td>Global Database replication + cross-region transfer</td><td class="num">–</td><td class="num">~$200</td><td class="num">~$300</td></tr>
+<tr><td>ElastiCache, ALB, NAT gateways (3 per region)</td><td class="num">~$450</td><td class="num">~$900</td><td class="num">~$900</td></tr>
+<tr><td>Monitoring, logs, synthetics, backups (cross-account)</td><td class="num">~$300</td><td class="num">~$600</td><td class="num">~$700</td></tr>
+<tr><th>Infrastructure total (rough)</th><th class="num">≈ $2,100</th><th class="num">≈ $4,700</th><th class="num">≈ $5,500</th></tr>
+</table>
+<p class="small">Why 9 nodes instead of 6 in the primary for B and C? Static stability: after losing one of three AZs, the remaining two must still carry 100% (6 nodes of work ÷ 2/3 = 9 nodes).</p>
+
+<h3>9.2 The part people forget: people, support and process</h3>
+<table>
+<tr><th>Item</th><th>Rough monthly cost</th><th>Needed for</th></tr>
+<tr><td>24×7 on-call SRE team, ~6 engineers (assume ₹30 lakh/year each)</td><td class="num">≈ ₹15 lakh (≈ $18,000)</td><td>99.99% (at 99.9% a smaller business-hours team can work)</td></tr>
+<tr><td>AWS Enterprise Support (published minimum; check current terms)</td><td class="num">≈ $15,000</td><td>Fast AWS escalation during incidents</td></tr>
+<tr><td>Observability / incident tooling (SaaS)</td><td class="num">$1,000–5,000</td><td>Detecting and managing incidents</td></tr>
+<tr><td>Game days, chaos testing, audits</td><td class="num">engineer time</td><td>Proving it works</td></tr>
+</table>
+<div class="box warn"><span class="label">The surprise</span>
+Going from 99.9% to 99.99%, the <b>infrastructure</b> roughly doubles (+$2,600/month), but the <b>people and support</b> add around $33,000/month. At four nines, <b>most of the cost is people and process, not servers.</b></div>
+
+<h3>9.3 The business case: is it worth it for PayKaro?</h3>
+<pre>Cost of 1 hour down at the evening peak:
+   230 payments/s × 3,600 s = 828,000 payments
+   828,000 × ₹2 fee        = ₹16.6 lakh lost fees per hour  (≈ $20,000)
+   + merchant SLA refunds, regulator scrutiny, customers switching apps (hard to price, often bigger)
+
+Worst case (all downtime at peak):
+   99.9 %  → 43 min/month × ₹16.6 lakh/60 ≈ ₹11.9 lakh/month
+   99.99 % → 4.3 min/month               ≈ ₹1.2 lakh/month
+   Difference                              ≈ ₹10.7 lakh/month (≈ $13,000) of direct fees
+
+Extra cost of 99.99 %: ≈ $2,600 infra + ~$33,000 people/support ≈ $35,000/month</pre>
+<div class="box ok"><span class="label">Reading the result like an architect</span>
+On direct fees alone, 99.99% doesn't pay for itself. What tips the decision for a payments company is what the spreadsheet can't easily hold: <b>trust</b> (a customer who can't pay twice may switch apps for good), <b>merchant contracts</b>, and <b>regulatory expectations</b>. So for PayKaro the answer is "yes, for the Pay and Balance journeys", and deliberately <b>not</b> for statements, offers and analytics, which stay at 99.9%. For GaramChai the same math says 99.5% is plenty: an hour down costs ≈ ₹5,000.</div>
+
+<!-- ============================ PART 10 ============================ -->
+<h2 class="pb">10. Interview questions with model answers</h2>
+<table>
+<tr><th style="width:36%">Question</th><th>Model answer (short)</th></tr>
+<tr><td>A client asks for 99.99%. What do you do?</td><td>Ask what an hour of downtime costs, which journeys need it, when, the RPO/RTO per data type and the regulations. Then show the cost of each nine and recommend a level per journey.</td></tr>
+<tr><td>How much downtime is 99.99%?</td><td>52.6 min/year, about 4.3 min per 30-day month, about 8.6 s per day.</td></tr>
+<tr><td>SLI vs SLO vs SLA?</td><td>SLI = a user-centric measurement; SLO = internal target; SLA = contract with penalties, looser than the SLO.</td></tr>
+<tr><td>What's an error budget and how is it used?</td><td>100% minus the SLO. While there's budget, ship; when it's spent, freeze risky changes and invest in reliability. Alert on burn rate.</td></tr>
+<tr><td>RPO vs RTO?</td><td>RPO = data you can lose (look back from the disaster); RTO = time to recover (look forward). RPO comes from the replication method; RTO from automation.</td></tr>
+<tr><td>How do you calculate the availability of a system?</td><td>Serial parts multiply; redundant parts: 1 − product of unavailabilities; then subtract failover time and check the independence assumption.</td></tr>
+<tr><td>Can one AWS region give 99.99%?</td><td>On SLA math, three 99.99% services in a chain give about 99.97%. Plus a regional event can exceed the yearly budget alone. For a hard 99.99% commitment: two regions with automatic failover.</td></tr>
+<tr><td>Sync vs async replication?</td><td>Sync: RPO 0 but every write waits, fine within a region. Async: no write penalty but seconds of RPO, used across regions. Design around the gap with idempotency and reconciliation.</td></tr>
+<tr><td>Why not active/active writes for a ledger?</td><td>Two regions accepting writes for the same account risk conflicts and double-spend; one writer region with fast promotion is safer.</td></tr>
+<tr><td>What is static stability?</td><td>Pre-provisioned capacity so that losing an AZ or region needs no scaling action during the emergency.</td></tr>
+<tr><td>Replication exists, so why keep backups?</td><td>Replication copies mistakes and attacks instantly. Backups (PITR, cross-account, immutable) protect against logical corruption and ransomware.</td></tr>
+<tr><td>How do AWS SLAs work?</td><td>They're service-credit thresholds, not guarantees; a credit is a small refund, and it doesn't cover your losses.</td></tr>
+<tr><td>What causes most outages?</td><td>Changes: deployments and configuration. Hence canaries, automatic rollback, one region/cell at a time, feature flags.</td></tr>
+<tr><td>How do you know DR works?</td><td>Practised game days and restore drills, measured against the RTO/RPO; chaos experiments with AWS FIS.</td></tr>
+<tr><td>Where does the money go at 99.99%?</td><td>Infra roughly doubles, but people (24×7 on-call), support and process dominate.</td></tr>
+</table>
+
+<!-- ============================ PART 11 ============================ -->
+<h2>11. Back to GaramChai: the same ideas in our lab</h2>
+<table>
+<tr><th>Idea from this guide</th><th>PayKaro (AWS)</th><th>GaramChai (our kubeadm lab)</th></tr>
+<tr><td>Availability target</td><td>99.99% for Pay</td><td>99.5% (3.6 h/month); ₹5,000 per hour down doesn't justify more</td></tr>
+<tr><td>RPO / RTO</td><td>≈ 0 / &lt; 5 min</td><td>Orders: 4 h / 1 h (Postgres backup CronJob every 4 h); etcd: 6 h</td></tr>
+<tr><td>Redundancy</td><td>3 AZs × 2 regions</td><td>2 worker nodes; ≥ 2 replicas + <code>topologySpreadConstraints</code> (Phase 9)</td></tr>
+<tr><td>Fast recovery (MTTR)</td><td>Automatic failover</td><td>Readiness/liveness probes, Deployment self-healing (Phase 3)</td></tr>
+<tr><td>Safe maintenance</td><td>PDBs, one AZ at a time</td><td>PodDisruptionBudget + <code>kubectl drain</code> (Phase 10)</td></tr>
+<tr><td>Safe changes</td><td>Canary + auto rollback</td><td>Rolling update + <code>kubectl rollout undo</code> (Phase 3)</td></tr>
+<tr><td>Capacity</td><td>Static stability, Karpenter</td><td>requests/limits, HPA, 50-user load test (Phase 10)</td></tr>
+<tr><td>Backups that are proven</td><td>AWS Backup + drills</td><td>etcd timer + restore drill (done ✅), Postgres drill (Phase 6)</td></tr>
+<tr><td>Honest single points of failure</td><td>Removed</td><td>1 control plane, 1 Postgres, NFS on cka-m: documented, accepted for a lab</td></tr>
+</table>
+
+<!-- ============================ PART 12 ============================ -->
+<h2>12. Glossary</h2>
+<table>
+<tr><th>Term</th><th>One-line meaning</th></tr>
+<tr><td>Availability</td><td>Share of time (or of requests) the service works for users</td></tr>
+<tr><td>Nines</td><td>Shorthand for availability: 99.99% = "four nines"</td></tr>
+<tr><td>SLI / SLO / SLA</td><td>Measurement / internal target / contract with penalties</td></tr>
+<tr><td>Error budget</td><td>Allowed unreliability: 100% − SLO</td></tr>
+<tr><td>Burn rate</td><td>How fast the error budget is being used; 1 = exactly on plan</td></tr>
+<tr><td>MTBF</td><td>Average time between failures (bigger is better)</td></tr>
+<tr><td>MTTD / MTTA</td><td>Average time to detect / to acknowledge an incident</td></tr>
+<tr><td>MTTR</td><td>Average time to recover service (smaller is better)</td></tr>
+<tr><td>RPO</td><td>Maximum data loss, measured as time before the disaster</td></tr>
+<tr><td>RTO</td><td>Maximum time to restore service after the disaster</td></tr>
+<tr><td>MTD</td><td>Maximum tolerable downtime before serious business damage</td></tr>
+<tr><td>Durability</td><td>Probability data isn't lost (different from availability)</td></tr>
+<tr><td>Availability Zone (AZ)</td><td>One or more separate data centres in a region, with independent power and network</td></tr>
+<tr><td>Region</td><td>A geographic area with several AZs (Mumbai, Hyderabad)</td></tr>
+<tr><td>Serial / parallel availability</td><td>Chain: multiply. Redundant copies: 1 − product of unavailabilities</td></tr>
+<tr><td>Sync / async replication</td><td>Copy confirmed before / after the write is acknowledged</td></tr>
+<tr><td>Static stability</td><td>Enough capacity pre-provisioned to survive a failure without scaling</td></tr>
+<tr><td>Blast radius</td><td>How many users one failure or bad change can affect</td></tr>
+<tr><td>Idempotency key</td><td>Unique request ID so a retry never charges twice</td></tr>
+<tr><td>Circuit breaker</td><td>Stops calling a failing dependency for a while; fail fast</td></tr>
+<tr><td>Canary release</td><td>New version to a small share of traffic first, rollback on bad SLIs</td></tr>
+<tr><td>Game day / chaos engineering</td><td>Deliberately causing failures to prove recovery works</td></tr>
+<tr><td>Backup &amp; restore / pilot light / warm standby / active-active</td><td>DR strategies from cheapest and slowest to most expensive and fastest</td></tr>
+</table>
+<p class="small">Sources for AWS figures (checked Sept 2026): AWS SLA pages for EC2, ELB, RDS, Aurora, EKS, DynamoDB, Route 53, CloudFront; Aurora Global Database product page. SLAs and prices change: always re-check before quoting them to a client.</p>
+
+</body>
+</html>

@@ -30,7 +30,9 @@ The client project is the vehicle. The actual outcome is that **Vishal can expla
 
 **Out of scope (for now)**
 - Public domain / public internet exposure
-- Payment gateway, real SMS/email
+- Payment gateway, real SMS/email (customers pay at the counter on pickup)
+- Delivery and delivery tracking (pickup only for now)
+- Item substitution negotiation ("we don't have X, would you like Y?")
 - Service mesh, GitOps (Argo CD), full Prometheus/Grafana (RAM limits; stretch goals only)
 - Multi-cluster / cloud
 
@@ -38,7 +40,7 @@ The client project is the vehicle. The actual outcome is that **Vishal can expla
 | Constraint | Impact |
 |---|---|
 | Nodes have 2 vCPU / 4 GB RAM (~3.58 GiB allocatable) | Still no JVM or service mesh; strict requests/limits on every pod |
-| Small root disks (10–12 GB), cka-w2 under DiskPressure at audit | Grow disks in Phase 0; keep images small (multi-stage, alpine/distroless) |
+| Root disks were 10–12 GB (cka-w2 under DiskPressure at the audit); grown to 58–67 GB in Phase 0 | Still keep images small (multi-stage, alpine/distroless): pulls go over the NAT link and images live on an HDD |
 | kubeadm cluster (no cloud) | No built-in LoadBalancer or dynamic storage: we add MetalLB + NFS CSI |
 | No registered DNS | `garamchai.test` via Windows hosts file; our own CA for TLS |
 | Single-person team, learning pace | Small steps, everything documented |
@@ -46,21 +48,89 @@ The client project is the vehicle. The actual outcome is that **Vishal can expla
 ## 6. Requirements questionnaire (what an architect asks BEFORE building)
 To be completed together in **Phase 1**. An architect never starts with YAML. They start with questions. Answers will be recorded here.
 
-**Functional**
-- What can a customer do? (browse menu, sign up/login, place order, view order history?)
-- What can an admin do? (add menu items, upload images, see daily sales?)
-- Are there reports? How often?
+**Functional** ✅ decided 2026-09-25
 
-**Non-functional**
-- Load: 50 concurrent users. What's the peak? Requests per second per user?
-- Availability target (99%? 99.9%?) and acceptable downtime for deploys?
-- Response time target (e.g. p95 < 300 ms)?
-- Data retention and backups: how often, how long kept, what's the restore time target (RTO/RPO)?
+Roles:
+| Role | Who | Can do |
+|---|---|---|
+| Customer | Anyone who signs up | Browse, order, cancel, see own orders |
+| Staff | Counter staff | Accept/reject orders, move them through the lifecycle |
+| Admin | Shop owner | Everything staff can do, plus menu, availability, coupons, reports |
 
-**Security**
-- What data is sensitive? (passwords, phone numbers, addresses)
-- Who may access the cluster, and with what permissions?
-- TLS everywhere or only at the edge?
+Features:
+| # | Feature | Who | Leads to (K8s / architecture) |
+|---|---|---|---|
+| F1 | Browse the menu **without logging in** | Customer | menu-service, public; Redis cache in front of Postgres |
+| F2 | Sign up / log in, with an **opt-in checkbox for offers** (off by default) | Customer | auth-service, JWT, **Secret** for the signing key |
+| F3 | Place an order (**login required**, **pickup at the shop only**) | Customer | order-service → discount-service (sync) |
+| F4 | Apply a coupon code at checkout | Customer | discount-service, **internal only** (**NetworkPolicy**) |
+| F5 | See own order history and live status | Customer | order-service + Postgres (**StatefulSet**, **PVC**) |
+| F6 | "Order accepted / rejected / ready for pickup" message (fake SMS, printed to logs) | Customer | notification worker via Redis Streams (no Service) |
+| F7 | Add/edit menu items and **upload photos** | Admin | shared image storage (**PV/PVC RWX** on NFS) |
+| F8 | Create coupons | Admin | discount-service |
+| F9 | Daily sales report, overnight | Admin | **CronJob** |
+| F10 | Expire old coupons every night | System | **CronJob** |
+| F11 | Mark the shop **open/closed** and items **available/out of stock**; unavailable items can't be ordered | Admin | menu-service; order-service validates before accepting |
+| F12 | Accept or reject orders (reason `CLOSED` / `OUT_OF_STOCK` / `OTHER` + a suggestion text) | Staff | order-service |
+| F13 | Orders nobody responds to within 10 min become `EXPIRED` | System | periodic job (**CronJob**) |
+
+Order lifecycle:
+```
+PLACED ──(staff accepts)──► PREPARING ──► READY ──(customer collects)──► COMPLETED
+  │
+  ├──(staff rejects: CLOSED / OUT_OF_STOCK / OTHER + suggestion)──► REJECTED
+  ├──(customer cancels, only while PLACED)────────────────────────► CANCELLED
+  └──(no staff response within 10 min)────────────────────────────► EXPIRED
+```
+
+Decisions and why:
+- **Login required, no guest checkout:** the account gives email + phone for order updates and (with consent) offers; one ordering path; order history works. Consent is required by law (India DPDP Act 2023 / GDPR), hence the opt-in checkbox.
+- **Prevent rather than reject (F11):** a closed shop or an out-of-stock item is blocked on the menu, so customers don't place orders that get rejected. REJECTED remains for surprises (the last milk ran out).
+- **No substitution negotiation:** a two-way "would you like Y instead?" flow needs a waiting state, notifications and timeouts, and teaches no new Kubernetes object. Staff put a suggestion in the rejection message instead.
+- **Pickup only:** no delivery staff yet; delivery would add addresses (more personal data), a delivery step and tracking. Later phase.
+
+**Non-functional** ✅ decided 2026-09-25
+| # | Requirement | Target | Leads to |
+|---|---|---|---|
+| N1 | Load | 50 concurrent users; ~5 req/s average, **~20 req/s at peak** (8–10 am, 5–7 pm) | k6 load test + **HPA** (Phase 10) |
+| N2 | Availability | **99.5 %** (≈ 3.6 h down per month); **zero downtime during deploys** | Rolling updates, readiness probes, **PDB**, ≥ 2 replicas of stateless services |
+| N3 | Speed | p95 < 300 ms for menu and order APIs | requests/limits, Redis cache for the menu |
+| N4 | Orders data | **RPO 4 h**, RTO 1 h; backups kept 7 days | Postgres backup **CronJob every 4 h** to NFS + a restore drill |
+| N5 | Retention | Order history kept 1 year, then deleted | Storage limitation (DPDP/GDPR); a cleanup job |
+
+Payment: customers pay at the counter on pickup (no payment data in the system).
+
+Honest risks to N2 (single points of failure in this lab): 1 Postgres instance, 1 control plane, and the NFS server on cka-m. If cka-m is down, the running pods keep working, but nothing can be changed, and anything that reads or writes NFS stops. 99.5 % is realistic only because failures here are rare and short. We'll measure it, not assume it.
+
+**Security, part 1: protecting data** ✅ decided 2026-09-25
+| Data | Sensitivity |
+|---|---|
+| Menu, prices | public |
+| Orders | low |
+| Email, phone | **personal data** (DPDP/GDPR) |
+| Passwords | **high** (people reuse them) |
+| Keys, DB passwords | **critical** (whoever has them becomes the app) |
+
+| # | Rule | Leads to |
+|---|---|---|
+| S1 | Passwords stored only as **bcrypt** hashes (slow + salted, so stolen hashes are hard to brute-force) | auth-service code |
+| S2 | Keys and DB passwords only in **Secrets**; only `*.example.yaml` in Git | **Secret**, `.gitignore` |
+| S3 | **Encryption at rest** for Secrets in etcd | `EncryptionConfiguration` on the API server (Phase 8) |
+| S4 | **One DB user per service**; only auth-service can read personal data | Postgres roles/grants (Phase 5) |
+| S5 | **TLS at the edge** (browser → Traefik); inside the cluster, default-deny **NetworkPolicy** | Ingress/Gateway + cert-manager (Phase 7), NetworkPolicy (Phase 8) |
+
+Not chosen: mTLS between services (needs a service mesh, too heavy for our RAM).
+
+**Security, part 2: access** ✅ decided 2026-09-25 (least privilege everywhere)
+| # | Who | Gets | Leads to |
+|---|---|---|---|
+| A1 | Vishal (admin) | Full admin via `admin.conf`; never shared, never committed | client certificate, group `kubeadm:cluster-admins` |
+| A2 | "intern" user | **Read-only in `garamchai` only** | **CSR**, Role/RoleBinding (Phase 8) |
+| A3 | Each service | Own **ServiceAccount**, no API permissions, `automountServiceAccountToken: false` | ServiceAccount (Phase 8) |
+| A4 | Backup Job | Small Role in `garamchai-data` only | Role/RoleBinding (Phase 6/8) |
+| A5 | SSH to nodes | Vishal only, key-based | node hardening |
+
+Deployments: **CI builds and pushes images only; deploys are run from the laptop** (`kubectl apply`). The cluster sits behind VMware NAT, so GitHub can't reach it, and exposing it would put cluster credentials on a third-party server. (Real-world alternative: GitOps, where an in-cluster agent pulls from Git; out of scope for RAM.)
 
 **Operations**
 - How are releases done? Rollback expectations?

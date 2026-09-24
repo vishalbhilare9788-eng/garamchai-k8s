@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Cluster Fundamentals</title>
+<link rel="stylesheet" href="study.css"></head><body>
+
+<section class="cover">
+  <div class="kicker">Phase 0 · Study notes 1 of 5</div>
+  <h1>How a Kubernetes Cluster Works</h1>
+  <div class="sub">Every component and its job, how the cluster boots, the objects it creates,<br>how nodes join, and how Kubernetes decides who you are and what you may do</div>
+  <div class="box"><span class="label">How to use these notes</span>
+  Read one part per sitting. Each idea goes: <b>plain meaning → analogy → our lab → interview line</b>. At the end there's a quiz; answer it on paper <i>before</i> looking at the answer key.</div>
+  <h3>Contents</h3>
+  <ol>
+    <li>The cast: master and worker components</li>
+    <li>Tools vs components: kubectl, crictl, kubeadm, etcdctl</li>
+    <li>One order, followed through every component</li>
+    <li>How the cluster boots (the 4 layers, static pods)</li>
+    <li>What <code>kubeadm init</code> does, stage by stage</li>
+    <li>How a worker joins safely (TLS bootstrap)</li>
+    <li>Why nodes are NotReady until the CNI is installed</li>
+    <li>The objects that exist in a fresh cluster</li>
+    <li>Namespaced vs cluster-scoped objects</li>
+    <li>Capacity vs Allocatable, and taints you never added</li>
+    <li>Who are you, and what may you do? (authN, authZ, certificates, ServiceAccounts)</li>
+    <li>Quiz and answer key</li>
+  </ol>
+  <div class="meta">Lab: kubeadm v1.35.8 · CRI-O · Calico v3.32.0 · cka-m (control plane), cka-w1, cka-w2 · written 2026-09-25</div>
+</section>
+
+<!-- ===================================================== 1 -->
+<h2 class="pb">1. The cast: master and worker components</h2>
+<p><b>The analogy used throughout:</b> GaramChai as a chain of chai shops.</p>
+<ul>
+<li>The <b>master (control plane)</b> is the <b>head office</b>. It never makes chai itself. It decides, records and supervises.</li>
+<li>The <b>workers</b> are the <b>branches with kitchens</b>, where the chai (your containers) is actually made.</li>
+</ul>
+<p>In our lab, <b>cka-m</b> is the head office, and <b>cka-w1</b> and <b>cka-w2</b> are the branches. The head office also has a small kitchen (kubelet + CRI-O), but a sign on the door, the taint <code>node-role.kubernetes.io/control-plane:NoSchedule</code>, says "no customer orders here".</p>
+
+<svg width="680" height="300" viewBox="0 0 680 300" role="img" aria-label="Control plane and worker components">
+ <g font-family="Segoe UI, Arial" font-size="11">
+  <rect x="10" y="10" width="300" height="280" rx="6" fill="#eef5fc" stroke="#0b5cad" stroke-width="2"/>
+  <text x="22" y="30" font-weight="700" fill="#0b5cad">cka-m: control plane ("head office")</text>
+  <rect x="25" y="42" width="270" height="30" rx="4" fill="#fff" stroke="#0b5cad"/><text x="35" y="61"><tspan font-weight="700">kube-apiserver</tspan>: the front counter (port 6443)</text>
+  <rect x="25" y="80" width="130" height="44" rx="4" fill="#fff" stroke="#999"/><text x="33" y="98" font-weight="700">etcd</text><text x="33" y="114">the register book</text>
+  <rect x="165" y="80" width="130" height="44" rx="4" fill="#fff" stroke="#999"/><text x="173" y="98" font-weight="700">kube-scheduler</text><text x="173" y="114">the dispatcher</text>
+  <rect x="25" y="132" width="270" height="44" rx="4" fill="#fff" stroke="#999"/><text x="33" y="150" font-weight="700">kube-controller-manager</text><text x="33" y="166">the supervisors (dozens of control loops)</text>
+  <text x="25" y="196" fill="#57606a">the 4 above = static pods, started from files</text>
+  <rect x="25" y="204" width="130" height="36" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="33" y="226" font-weight="700">kubelet</text>
+  <rect x="165" y="204" width="130" height="36" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="173" y="226" font-weight="700">CRI-O</text>
+  <text x="25" y="258" fill="#57606a">+ kube-proxy, calico-node, CoreDNS ×2 (pods)</text>
+  <text x="25" y="276" fill="#57606a">orange = systemd services, not pods</text>
+  <rect x="370" y="10" width="300" height="280" rx="6" fill="#eaf7ee" stroke="#2e8b57" stroke-width="2"/>
+  <text x="382" y="30" font-weight="700" fill="#2e8b57">cka-w1 / cka-w2: workers ("branches")</text>
+  <rect x="385" y="42" width="130" height="44" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="393" y="60" font-weight="700">kubelet</text><text x="393" y="76">branch manager</text>
+  <rect x="525" y="42" width="130" height="44" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="533" y="60" font-weight="700">CRI-O (+ runc)</text><text x="533" y="76">the cooks</text>
+  <rect x="385" y="94" width="130" height="44" rx="4" fill="#fff" stroke="#999"/><text x="393" y="112" font-weight="700">kube-proxy</text><text x="393" y="128">phone switchboard</text>
+  <rect x="525" y="94" width="130" height="44" rx="4" fill="#fff" stroke="#999"/><text x="533" y="112" font-weight="700">calico-node</text><text x="533" y="128">roads between shops</text>
+  <rect x="385" y="146" width="270" height="70" rx="4" fill="#fff" stroke="#999" stroke-dasharray="4 3"/><text x="395" y="166" font-weight="700">your app pods</text><text x="395" y="184">frontend, auth, menu, order,</text><text x="395" y="200">discount, notification …</text>
+  <line x1="310" y1="57" x2="385" y2="64" stroke="#1f2328" stroke-width="1.5"/><text x="318" y="52" font-size="9.5">watch / report</text>
+ </g>
+</svg>
+
+<h3>1.1 Control-plane components (on cka-m)</h3>
+<table>
+<tr><th>Component</th><th>Analogy</th><th>Its one job</th><th>Runs as</th></tr>
+<tr><td><b>etcd</b></td><td>The register book</td><td>Stores <b>every</b> object: Pods, Deployments, Secrets, Nodes. The cluster's only memory</td><td>static pod</td></tr>
+<tr><td><b>kube-apiserver</b></td><td>The front counter, the only door</td><td>Everyone talks to it, and <b>only it</b> reads or writes etcd. It checks who you are (authentication), what you may do (RBAC), and whether your YAML is valid (admission), then saves it</td><td>static pod</td></tr>
+<tr><td><b>kube-scheduler</b></td><td>The dispatcher</td><td>Sees a new Pod with no node, picks the best node (enough Allocatable, taints OK, affinity), and <b>writes the decision down</b>. It starts nothing itself</td><td>static pod</td></tr>
+<tr><td><b>kube-controller-manager</b></td><td>The supervisors</td><td>Dozens of loops: "what's wanted? what exists? fix the difference". Examples: ReplicaSet controller, node lifecycle controller, EndpointSlice controller</td><td>static pod</td></tr>
+</table>
+
+<h3>1.2 Node components (on every node, including cka-m)</h3>
+<table>
+<tr><th>Component</th><th>Analogy</th><th>Its one job</th><th>Runs as</th></tr>
+<tr><td><b>kubelet</b></td><td>The branch manager</td><td>Asks the API server "which pods are assigned to me?", tells CRI-O to run them, runs the probes, reports status. Also starts the static pods on cka-m</td><td><b>systemd service</b></td></tr>
+<tr><td><b>CRI-O</b></td><td>The cooks</td><td>The <b>container runtime</b>: pulls images, creates containers. Under the hood it uses <b>runc</b> (the stove) to start the Linux process</td><td><b>systemd service</b></td></tr>
+<tr><td><b>kube-proxy</b></td><td>Phone switchboard</td><td>Turns Service IPs (e.g. 10.96.0.10) into iptables rules that forward to real pod IPs</td><td>DaemonSet pod</td></tr>
+<tr><td><b>Calico</b> (CNI)</td><td>Roads between shops</td><td>Gives every pod an IP from 172.17.0.0/16 and carries pod traffic between nodes (IPIP tunnels over 10.0.0.x)</td><td>DaemonSet pod</td></tr>
+<tr><td><b>CoreDNS</b></td><td>Phone directory</td><td>Turns <code>discount-service</code> into its Service IP</td><td>Deployment (2 pods)</td></tr>
+</table>
+
+<div class="box"><span class="label">Remember</span>
+Only <b>kubelet and CRI-O</b> are real systemd services. Something has to exist <i>before</i> any pod can run. Everything else is a pod started by the kubelet.</div>
+
+<div class="box ok"><span class="label">Interview line</span>
+"The control plane is the API server, etcd, the scheduler and the controller-manager. The API server is the only component that talks to etcd; everything else watches the API server and reacts. On every node the kubelet runs pods through the container runtime, kube-proxy implements Services, and the CNI plugin provides pod networking."</div>
+
+<!-- ===================================================== 2 -->
+<h2>2. Tools vs components</h2>
+<p>People mix these up in interviews. A <b>component</b> is part of the running cluster; a <b>tool</b> is something <i>you</i> run to talk to it.</p>
+<table>
+<tr><th>Tool</th><th>Talks to</th><th>Used for</th><th>Analogy</th></tr>
+<tr><td><b>kubectl</b></td><td>the <b>API server</b>, over the network, from anywhere</td><td>Everyday work: get, apply, describe, logs</td><td>Calling the front counter</td></tr>
+<tr><td><b>crictl</b></td><td><b>CRI-O on this one node</b> (local socket)</td><td>Debugging when the API server is down: <code>crictl ps</code>, <code>crictl logs</code></td><td>Walking into the kitchen and looking at the stove yourself</td></tr>
+<tr><td><b>kubeadm</b></td><td>the node itself</td><td>Building the cluster: init, join, upgrade, reset</td><td>The construction company</td></tr>
+<tr><td><b>etcdctl / etcdutl</b></td><td><b>etcd</b> directly</td><td>Backup, restore, health</td><td>Photocopying the register</td></tr>
+</table>
+<div class="box warn"><span class="label">kubectl vs crictl</span>
+kubectl shows what Kubernetes <i>thinks</i> is running. crictl shows what is <i>actually</i> running on that node. When the API server is dead, kubectl is blind and crictl still works. That's why we used <code>crictl ps</code> during the etcd restore drill while the control plane was stopped.</div>
+
+<!-- ===================================================== 3 -->
+<h2 class="pb">3. One order, followed through every component</h2>
+<p>You run <code>kubectl create deployment chai --image=nginx --replicas=2</code>. Here's what happens, in order:</p>
+<svg width="680" height="250" viewBox="0 0 680 250" role="img" aria-label="Request flow through components">
+ <defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#1f2328"/></marker></defs>
+ <g font-family="Segoe UI, Arial" font-size="10.5">
+  <rect x="10" y="100" width="80" height="40" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="28" y="124" font-weight="700">kubectl</text>
+  <rect x="150" y="100" width="110" height="40" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="160" y="124" font-weight="700">kube-apiserver</text>
+  <rect x="150" y="200" width="110" height="36" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="190" y="222" font-weight="700">etcd</text>
+  <rect x="330" y="10" width="160" height="40" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="340" y="27" font-weight="700">controller-manager</text><text x="340" y="42">Deployment → RS → 2 Pods</text>
+  <rect x="330" y="100" width="160" height="40" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="340" y="117" font-weight="700">scheduler</text><text x="340" y="132">pod 1 → w1, pod 2 → w2</text>
+  <rect x="540" y="60" width="130" height="40" rx="4" fill="#eaf7ee" stroke="#2e8b57"/><text x="550" y="77" font-weight="700">kubelet (w1)</text><text x="550" y="92">"a pod for me!"</text>
+  <rect x="540" y="130" width="130" height="40" rx="4" fill="#eaf7ee" stroke="#2e8b57"/><text x="550" y="147" font-weight="700">CRI-O + Calico</text><text x="550" y="162">container + pod IP</text>
+  <line x1="90" y1="120" x2="148" y2="120" stroke="#1f2328" marker-end="url(#a)"/><text x="100" y="112">①</text>
+  <line x1="205" y1="140" x2="205" y2="198" stroke="#1f2328" marker-end="url(#a)"/><text x="210" y="175">② save</text>
+  <line x1="260" y1="108" x2="328" y2="35" stroke="#1f2328" marker-end="url(#a)"/><text x="270" y="68">③④ watch</text>
+  <line x1="260" y1="120" x2="328" y2="120" stroke="#1f2328" marker-end="url(#a)"/><text x="283" y="113">⑤</text>
+  <line x1="490" y1="115" x2="538" y2="85" stroke="#1f2328" marker-end="url(#a)"/><text x="500" y="92">⑥</text>
+  <line x1="605" y1="100" x2="605" y2="128" stroke="#1f2328" marker-end="url(#a)"/><text x="610" y="118">⑦</text>
+  <path d="M540,160 C400,230 300,160 262,135" fill="none" stroke="#2e8b57" stroke-dasharray="4 3" marker-end="url(#a)"/><text x="360" y="200" fill="#2e8b57">⑧ "Running" reported back</text>
+ </g>
+</svg>
+<ol>
+<li><b>kubectl</b> sends the Deployment to the <b>API server</b>.</li>
+<li>The API server checks your certificate and RBAC permissions, then saves the Deployment in <b>etcd</b>.</li>
+<li>The <b>Deployment controller</b> (inside controller-manager) notices it and creates a ReplicaSet.</li>
+<li>The <b>ReplicaSet controller</b> notices "wants 2, has 0" and creates 2 Pod objects with <b>no node yet</b>.</li>
+<li>The <b>scheduler</b> picks cka-w1 and cka-w2 and writes that down.</li>
+<li>The <b>kubelet on cka-w1</b> notices "a pod is assigned to me".</li>
+<li>It asks <b>CRI-O</b> to pull and start the container, and CRI-O calls <b>Calico</b> for a pod IP.</li>
+<li>The kubelet reports "Running"; the API server saves it in etcd. <code>kubectl get pods</code> shows Running.</li>
+</ol>
+<div class="box"><span class="label">The two ideas that explain everything</span>
+<ol><li><b>Nobody talks to anybody directly.</b> Everything goes through the API server.</li>
+<li><b>Every component just watches and reacts.</b> There's no boss giving orders. If a pod dies, step 4 simply notices "wants 2, has 1" again. That's what "self-healing" means.</li></ol></div>
+
+<!-- ===================================================== 4 -->
+<h2>4. How the cluster boots: the 4 layers</h2>
+<p><b>The puzzle:</b> the API server runs <i>inside a pod</i>. But pods are normally created <i>through</i> the API server. So how does the first pod ever start?</p>
+<p><b>The answer: static pods.</b> The kubelet reads YAML files from <code>/etc/kubernetes/manifests/</code> and starts them <b>directly from disk</b>, without asking the API server.</p>
+
+<svg width="600" height="215" viewBox="0 0 600 215" role="img" aria-label="Four boot layers">
+ <g font-family="Segoe UI, Arial" font-size="11.5">
+  <rect x="60" y="165" width="480" height="40" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="75" y="190"><tspan font-weight="700">1. Linux + systemd</tspan> start <tspan font-weight="700">CRI-O</tspan> and <tspan font-weight="700">kubelet</tspan> (the only non-pods)</text>
+  <rect x="60" y="115" width="480" height="40" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="75" y="140"><tspan font-weight="700">2. Control plane</tspan> from files: etcd → API server → controllers, scheduler</text>
+  <rect x="60" y="65" width="480" height="40" rx="4" fill="#eaf7ee" stroke="#2e8b57"/><text x="75" y="90"><tspan font-weight="700">3. Network</tspan>: calico-node + kube-proxy (DaemonSets) → nodes <tspan font-weight="700">Ready</tspan></text>
+  <rect x="60" y="15" width="480" height="40" rx="4" fill="#f3f5f7" stroke="#999"/><text x="75" y="40"><tspan font-weight="700">4. Everything else</tspan>: CoreDNS, then GaramChai's apps</text>
+ </g>
+</svg>
+
+<table>
+<tr><th>#</th><th>What comes alive</th><th>What it needs</th><th>How you'd see it</th></tr>
+<tr><td>1</td><td>Linux, systemd</td><td>nothing</td><td>VM console</td></tr>
+<tr><td>2</td><td>CRI-O and kubelet (systemd services)</td><td>the OS</td><td><code>systemctl status kubelet crio</code></td></tr>
+<tr><td>3</td><td>kubelet reads <code>/etc/kubernetes/manifests/</code> and starts the 4 static pods</td><td>only files on disk</td><td><code>sudo crictl ps</code></td></tr>
+<tr><td>4</td><td>etcd loads its data from <code>/var/lib/etcd</code></td><td>disk + PKI</td><td>the cluster's memory is back</td></tr>
+<tr><td>5</td><td>API server connects to etcd, opens 6443</td><td>etcd</td><td>kubectl answers</td></tr>
+<tr><td>6</td><td>controller-manager and scheduler connect, elect a leader</td><td>API server</td><td><code>kubectl get lease -n kube-system</code></td></tr>
+<tr><td>7</td><td>kubelets on all nodes report in (Node status, heartbeat Lease, mirror pods)</td><td>API server</td><td><code>kubectl get nodes</code></td></tr>
+<tr><td>8</td><td>DaemonSet pods: kube-proxy, calico-node</td><td>API server</td><td><code>kubectl get pods -n kube-system -o wide</code></td></tr>
+<tr><td>9</td><td>Node Ready (runtime OK + CNI network ready)</td><td>CNI</td><td>STATUS Ready</td></tr>
+<tr><td>10</td><td>Normal pods: CoreDNS, then apps</td><td>CNI + scheduler</td><td><code>kubectl get pods -A</code></td></tr>
+</table>
+<div class="box warn"><span class="label">Why restarts after a boot are normal</span>
+The 4 static pods start <b>at the same time</b>. The API server crashes and retries until etcd answers; the controller-manager and scheduler retry until the API server answers. So a few restarts right after a boot are harmless. Always check <b>when</b> a restart happened before worrying.</div>
+<div class="box ok"><span class="label">Interview line</span>
+"The kubelet is a systemd service. It starts the control plane as static pods from /etc/kubernetes/manifests, which solves the chicken-and-egg problem, because the API server itself runs in a pod. Once the API server is up, the DaemonSets bring up the network, nodes turn Ready, and normal workloads get scheduled. When a cluster won't come up, I debug from the bottom: systemctl status kubelet → crictl ps -a → crictl logs of the API server → etcd."</div>
+
+<!-- ===================================================== 5 -->
+<h2 class="pb">5. What <code>kubeadm init</code> does, stage by stage</h2>
+<p>These are the <code>[tags]</code> you saw in our own init output on 2026-09-23.</p>
+<table>
+<tr><th>Stage</th><th>What it does</th><th>Linux-boot analogy</th></tr>
+<tr><td><code>[preflight]</code></td><td>Checks swap, ports, runtime, CPU/RAM; pulls images. Stops <i>before</i> touching anything if something is wrong</td><td>BIOS self-test</td></tr>
+<tr><td><code>[certs]</code></td><td>Creates the cluster CA and every certificate in <code>/etc/kubernetes/pki</code> (API server, etcd has its <b>own</b> CA, front-proxy, and the <code>sa.key</code> that signs ServiceAccount tokens)</td><td>Secure-boot keys</td></tr>
+<tr><td><code>[kubeconfig]</code></td><td>Login files: <code>admin.conf</code> (you), <code>super-admin.conf</code> (break-glass, bypasses RBAC), plus files for kubelet, controller-manager, scheduler</td><td>User accounts</td></tr>
+<tr><td><code>[etcd]</code> <code>[control-plane]</code></td><td>Writes the 4 static pod manifests</td><td>initramfs on disk</td></tr>
+<tr><td><code>[kubelet-start]</code></td><td>Writes the kubelet config and starts it; it runs the 4 manifests</td><td>GRUB loads the kernel</td></tr>
+<tr><td><code>[wait-control-plane]</code></td><td>Waits for health checks. <b>The API server now creates the built-in objects itself</b>: default namespaces, the <code>kubernetes</code> Service, bootstrap RBAC</td><td>Kernel up</td></tr>
+<tr><td><code>[upload-config]</code></td><td>Saves the config as ConfigMaps (<code>kubeadm-config</code>, <code>kubelet-config</code>)</td><td>/etc saved</td></tr>
+<tr><td><code>[mark-control-plane]</code></td><td>Label + taint <code>control-plane:NoSchedule</code> on the master</td><td>—</td></tr>
+<tr><td><code>[bootstrap-token]</code></td><td>Join token (expires in 24 h) + RBAC so new nodes can request certificates</td><td>A visitor pass</td></tr>
+<tr><td><code>[addons]</code></td><td>CoreDNS (Deployment + Service <code>kube-dns</code> 10.96.0.10) and kube-proxy (DaemonSet)</td><td>Services start</td></tr>
+</table>
+
+<h3>5.1 Our build is a file in Git</h3>
+<p>We never run <code>kubeadm init</code> with loose flags. Everything is in <code>infra/kubeadm/kubeadm-config.yaml</code>, so the cluster can be rebuilt identically. The most important lines:</p>
+<pre>kubernetesVersion: v1.35.8            # pinned: a rebuild gives the same cluster
+controlPlaneEndpoint: "k8s-api:6443"  # a NAME, never a node IP: allows HA later; can't be changed after init
+podSubnet: "172.17.0.0/16"            # pod IPs
+serviceSubnet: "10.96.0.0/16"         # Service ClusterIPs
+advertiseAddress: "10.0.0.100"        # the API server's IP on the static cluster network
+criSocket: unix:///var/run/crio/crio.sock   # runtime = CRI-O
+evictionHard: memory.available 200Mi, nodefs.available 20%, ...   # when the kubelet starts evicting</pre>
+
+<!-- ===================================================== 6 -->
+<h2>6. How a worker joins safely (TLS bootstrap)</h2>
+<p>A new worker has <b>nothing</b>: no certificate, no kubeconfig, just the join command. The question is how two strangers learn to trust each other.</p>
+<table>
+<tr><th>Step</th><th>What happens</th><th>Office analogy</th></tr>
+<tr><td>1. Discovery</td><td>The worker reads <code>cluster-info</code> (in <code>kube-public</code>). The <b>token</b> proves it came from the real cluster; the <b>CA cert hash</b> in the join command pins the CA, so a fake API server can't pretend</td><td>Compare the office's stamp with the fingerprint you were given</td></tr>
+<tr><td>2. TLS bootstrap</td><td>The kubelet logs in with the token and sends a <b>CSR</b>: "please sign a certificate for <code>system:node:cka-w1</code>"</td><td>Use a visitor pass to apply for an employee badge</td></tr>
+<tr><td>3. Approval</td><td>The CSR is auto-approved and <b>signed by the cluster CA</b></td><td>HR stamps the badge</td></tr>
+<tr><td>4. Real credentials</td><td>The kubelet saves its certificate; the token is no longer needed</td><td>Visitor pass returned</td></tr>
+<tr><td>5. Registration</td><td>The kubelet creates its <b>Node</b> object (InternalIP = <code>--node-ip</code>)</td><td>Name on the office board</td></tr>
+<tr><td>6. Heartbeat</td><td>Every ~10 s it renews its <b>Lease</b> in <code>kube-node-lease</code>; missing heartbeats → NotReady</td><td>"I'm alive" check-ins</td></tr>
+<tr><td>7. DaemonSets</td><td>kube-proxy and calico-node are created on the new node automatically</td><td>New branch gets phones and roads</td></tr>
+</table>
+<div class="box warn"><span class="label">Why workers don't get admin.conf</span>
+A worker's kubelet can only see its own node and pods (the Node authorizer). If an admin kubeconfig sat on a worker, one container escape would give an attacker the whole cluster.</div>
+
+<!-- ===================================================== 7 -->
+<h2 class="pb">7. Why nodes are NotReady until the CNI is installed</h2>
+<ol>
+<li>Right after <code>kubeadm init</code>, there's no network config in <code>/etc/cni/net.d/</code>, so the kubelet reports <b>NetworkReady=false</b> and the Node is <b>NotReady</b>.</li>
+<li>The node lifecycle controller adds the taint <code>node.kubernetes.io/not-ready:NoSchedule</code>.</li>
+<li>CoreDNS stays <b>Pending</b>. In our lab it tolerated <code>not-ready</code> only with effect NoExecute, not NoSchedule. <b>A toleration must match both the key and the effect.</b></li>
+<li>We install Calico: its DaemonSet copies the CNI binary and config onto each node, gives the node a /26 block of pod IPs, and shares routes over BGP.</li>
+<li>The config file exists → NetworkReady → node <b>Ready</b> → taint removed → CoreDNS gets scheduled.</li>
+</ol>
+<div class="box"><span class="label">Linux analogy</span>The machine has booted, but the network service hasn't started yet, so nothing that needs the network can come up.</div>
+
+<!-- ===================================================== 8 -->
+<h2>8. The objects that exist in a fresh cluster</h2>
+<table>
+<tr><th>Object</th><th>Created by</th><th>Why it exists</th></tr>
+<tr><td>Namespace <code>default</code></td><td>API server</td><td>Where objects go if you don't say otherwise. Don't run real apps there</td></tr>
+<tr><td>Namespace <code>kube-system</code></td><td>API server</td><td>The cluster's own components; can't be deleted</td></tr>
+<tr><td>Namespace <code>kube-public</code></td><td>API server</td><td>Readable by everyone, even unauthenticated. Holds <code>cluster-info</code> for joining nodes</td></tr>
+<tr><td>Namespace <code>kube-node-lease</code></td><td>API server</td><td>One Lease per node = cheap, fast heartbeats</td></tr>
+<tr><td>Service <code>kubernetes</code> (10.96.0.1)</td><td>API server</td><td>How <b>pods</b> reach the API server</td></tr>
+<tr><td>Service <code>kube-dns</code> (10.96.0.10)</td><td>kubeadm</td><td>CoreDNS's address, written into every pod's <code>/etc/resolv.conf</code></td></tr>
+<tr><td>ServiceAccount <code>default</code> in every namespace</td><td>controller-manager</td><td>The identity a pod gets if you don't choose one</td></tr>
+<tr><td>ClusterRoles <code>cluster-admin</code>, <code>admin</code>, <code>edit</code>, <code>view</code></td><td>API server</td><td>Standard permissions, <b>recreated automatically</b> at every API server start</td></tr>
+<tr><td>ClusterRoleBinding <code>kubeadm:cluster-admins</code></td><td>kubeadm</td><td>Gives admin.conf its power. <b>Not</b> recreated automatically: losing it caused our 403s during the incident</td></tr>
+<tr><td>Leases for controller-manager and scheduler</td><td>those components</td><td>Leader election: with 3 masters, only one is active at a time</td></tr>
+<tr><td>4 static pods</td><td>kubelet (from files)</td><td>The control plane. Visible via the API as <b>mirror pods</b>; delete one and it comes straight back, because the file is the truth</td></tr>
+</table>
+
+<!-- ===================================================== 9 -->
+<h2 class="pb">9. Namespaced vs cluster-scoped objects</h2>
+<div class="box bad"><span class="label">The common confusion (we had it too)</span>
+"<code>kube-system</code> is cluster scope, <code>garamchai</code> is application scope" is <b>wrong</b>. Both are just namespaces, the same kind of thing. <b>Scope is a property of the object <i>type</i> (the <code>kind:</code>), not of a namespace.</b></div>
+<ul>
+<li><b>Namespaced kind:</b> every object of this type must live inside <i>some</i> namespace (kube-system, garamchai, default…).</li>
+<li><b>Cluster-scoped kind:</b> objects of this type live outside all namespaces. There's no <code>namespace:</code> field at all.</li>
+</ul>
+<h3>The apartment-building analogy</h3>
+<ul>
+<li><b>Namespaces</b> = apartments. <code>kube-system</code> is the caretaker's flat; <code>garamchai</code> is ours. Both are ordinary apartments.</li>
+<li><b>Namespaced objects</b> = furniture. A sofa is always inside some apartment. Two apartments can each have a sofa called "sofa" without any conflict.</li>
+<li><b>Cluster-scoped objects</b> = the building itself: floors, lifts, the list of apartments. They don't belong to one flat, because every flat uses them.</li>
+</ul>
+<table>
+<tr><th>Namespaced (belongs to one app/team)</th><th>Cluster-scoped (shared by everyone)</th></tr>
+<tr><td>Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet</td><td>Node</td></tr>
+<tr><td>Service, ConfigMap, Secret, ServiceAccount</td><td>Namespace (a flat can't be inside itself)</td></tr>
+<tr><td>PersistentVolumeClaim (the app's <i>request</i> for storage)</td><td>PersistentVolume (the actual storage), StorageClass</td></tr>
+<tr><td>Role, RoleBinding</td><td>ClusterRole, ClusterRoleBinding, CustomResourceDefinition, IngressClass</td></tr>
+</table>
+<p><b>Test to use:</b> "Can two teams each have their own one with the same name?" If yes, it's namespaced. <b>Rule of thumb:</b> if the kind's name starts with "Cluster", it's cluster-scoped.</p>
+<p><b>Why is a Node cluster-scoped?</b> It's shared infrastructure: cka-w1 runs pods from <i>every</i> namespace at the same time, so it can't belong to any one of them.</p>
+<pre>kubectl api-resources --namespaced=true    # list namespaced kinds
+kubectl api-resources --namespaced=false   # list cluster-scoped kinds
+kubectl get nodes -n kube-system           # -n is ignored: nodes have no namespace</pre>
+<div class="box warn"><span class="label">Real lesson from Phase 0</span>
+Deleting the <code>argocd</code> namespace did <b>not</b> delete Argo CD's 3 CRDs and 6 ClusterRoles/Bindings, because they're cluster-scoped. We had to delete them separately.</div>
+
+<!-- ===================================================== 10 -->
+<h2>10. Capacity vs Allocatable, and taints you never added</h2>
+<h3>10.1 Capacity vs Allocatable (per node)</h3>
+<pre>Allocatable = Capacity − kube-reserved − system-reserved − eviction threshold
+
+Our worker:  ~3.8 GiB capacity − (no reservations set) − 200 Mi eviction threshold
+           ≈ 3.58 GiB allocatable</pre>
+<ul>
+<li><b>Capacity:</b> everything the node has.</li>
+<li><b>Allocatable:</b> what's left for pods after keeping some back for the OS, the kubelet and a safety margin.</li>
+<li><b>The scheduler uses Allocatable, and adds up the pods' <i>requests</i>, not their actual usage.</b> A node can be 90% idle and still reject a pod, because the requests are "full".</li>
+</ul>
+<pre>kubectl get node cka-w1 -o jsonpath='{.status.capacity.memory}{"  "}{.status.allocatable.memory}{"\n"}'</pre>
+
+<h3>10.2 The disk-pressure taint on cka-w2 (from our audit)</h3>
+<p>A three-step chain, and interviewers want all three steps:</p>
+<ol>
+<li><b>kubelet</b> saw free disk fall below its eviction threshold → set the node condition <code>DiskPressure=True</code> → <b>evicted a pod</b> to free space.</li>
+<li><b>kube-controller-manager</b> (node lifecycle controller) turned the condition into the taint <code>node.kubernetes.io/disk-pressure:NoSchedule</code>.</li>
+<li><b>kube-scheduler</b> respected the taint and stopped placing pods on cka-w2, so everything crowded onto cka-w1.</li>
+</ol>
+<p>It disappeared on its own after we <b>added a 40 GB disk</b>: the condition went False (after a ~5-minute wait so it doesn't flap), and the taint was removed.</p>
+<div class="box warn"><span class="label">Don't remove condition taints by hand</span>Kubernetes owns them and puts them straight back. Fix the cause (the disk), and the taint goes by itself.</div>
+<p class="small">Not kube-proxy: kube-proxy only programs Service rules and has nothing to do with disks or taints.</p>
+
+<!-- ===================================================== 11 -->
+<h2 class="pb">11. Who are you, and what may you do?</h2>
+<h3>11.1 Two questions at every door</h3>
+<table>
+<tr><th>Step</th><th>Question</th><th>Hotel analogy</th><th>Failure</th></tr>
+<tr><td><b>Authentication</b> (authN)</td><td>Who are you?</td><td>Show your ID at reception</td><td><b>401 Unauthorized</b> ("I don't know you"; the name is misleading)</td></tr>
+<tr><td><b>Authorization</b> (authZ)</td><td>What may you do?</td><td>Your key card only opens your room</td><td><b>403 Forbidden</b> ("I know you, but no")</td></tr>
+</table>
+<p>After both, <b>admission</b> runs (adds defaults, enforces policies), then the object is saved. <b>Our incident:</b> <code>kubectl auth whoami</code> worked (authN OK), but everything returned 403 because the RoleBinding was gone (authZ failed).</p>
+
+<h3>11.2 Humans vs programs</h3>
+<p><b>The analogy:</b> the API server is a security guard at an office entrance. Humans and delivery robots come through the door, and the guard treats them differently.</p>
+<table>
+<tr><th></th><th>Humans (you, an intern)</th><th>Programs (order-service, backup Job)</th></tr>
+<tr><td>Identity</td><td>A name inside a <b>certificate</b> (<code>CN=</code> = name, <code>O=</code> = group), or a company login (OIDC)</td><td>A <b>ServiceAccount</b> object</td></tr>
+<tr><td>Stored in the cluster?</td><td><b>No.</b> There's no User object. <code>kubectl get users</code> fails</td><td><b>Yes</b>, in etcd: <code>kubectl get serviceaccounts</code></td></tr>
+<tr><td>How it's checked</td><td>The guard checks the card has the <b>CA's seal</b>, then believes the name and group printed on it</td><td>A token mounted into the pod</td></tr>
+<tr><td>Why</td><td>Humans already have an identity elsewhere (HR, AD, SSO)</td><td>Programs only exist inside the cluster</td></tr>
+</table>
+<pre># See your own ID card (on cka-m):
+sudo grep client-certificate-data /etc/kubernetes/admin.conf | awk '{print $2}' | base64 -d \
+  | openssl x509 -noout -subject -issuer -enddate
+# subject = O = kubeadm:cluster-admins, CN = kubernetes-admin   ← group + name
+# issuer  = CN = kubernetes                                     ← the cluster CA's seal</pre>
+<p>So <b>your group comes from the <code>O=</code> field of the client certificate inside admin.conf</b>; the file is only the wallet.</p>
+
+<h3>11.3 Why the CA key is dangerous</h3>
+<ul>
+<li>Whoever holds <code>ca.key</code> can print <b>any</b> ID card, for example <code>CN=hacker, O=kubeadm:cluster-admins</code>, and the guard lets them in as admin.</li>
+<li><b>Kubernetes can't revoke client certificates.</b> A stolen admin certificate works until it expires (up to 1 year with kubeadm). A stolen password, by contrast, can be changed or disabled in seconds.</li>
+<li>That's why the PKI backup is root-only, admin.conf is never shared or committed, and companies log humans in through <b>OIDC</b> (single sign-on) instead.</li>
+</ul>
+
+<h3>11.4 Least privilege in GaramChai (decided in Phase 1)</h3>
+<table>
+<tr><th>Who</th><th>Gets</th></tr>
+<tr><td>Vishal (admin)</td><td>admin.conf, never shared</td></tr>
+<tr><td>"intern" user (Phase 8)</td><td>Read-only, only in <code>garamchai</code> (certificate via a CSR + Role/RoleBinding)</td></tr>
+<tr><td>Each service</td><td>Its own ServiceAccount, no API permissions, no token mounted</td></tr>
+<tr><td>Backup Job</td><td>A small Role in <code>garamchai-data</code> only</td></tr>
+</table>
+
+<!-- ===================================================== QUIZ -->
+<h2 class="pb">12. Quiz</h2>
+<p>Answer on paper first. The answer key is on the next page.</p>
+<ol class="quiz">
+<li>Which is the only component that reads and writes etcd?<span class="opts">a) kubelet · b) kube-scheduler · c) kube-apiserver · d) kube-controller-manager</span></li>
+<li>Which two Kubernetes pieces run as systemd services on our nodes, and why can't they be pods?</li>
+<li>The scheduler has decided a pod goes to cka-w1. Which component actually starts the container?</li>
+<li>The API server is down. Which tool can still show you the running containers on cka-m?<span class="opts">a) kubectl · b) crictl · c) kubeadm · d) etcdctl</span></li>
+<li>What are static pods, and what problem do they solve?</li>
+<li>After a reboot, kube-apiserver shows 3 restarts. Is that a problem? What do you check first?</li>
+<li>A freshly initialised master is NotReady and CoreDNS is Pending. Why? What fixes it?</li>
+<li>Why must <code>controlPlaneEndpoint</code> be a DNS name or VIP, and not a node IP?</li>
+<li>During a join, what does the <code>--discovery-token-ca-cert-hash</code> protect against?</li>
+<li>Namespaced or cluster-scoped: Pod, Node, Service, Namespace, Secret, PersistentVolume, Deployment, ClusterRole, ConfigMap, StorageClass, Role, PersistentVolumeClaim?</li>
+<li>Why is a Node cluster-scoped?</li>
+<li>You deleted a namespace, but some of the app's objects remain. Which ones, and why?</li>
+<li>A worker has 4 GB RAM but ~3.58 GiB allocatable. Where did the difference go, and which number does the scheduler use?</li>
+<li>A node is 80% idle, yet a new pod stays Pending with "Insufficient memory". How is that possible?</li>
+<li>Explain, component by component, how cka-w2 got the <code>disk-pressure:NoSchedule</code> taint and how it went away.</li>
+<li>What's the difference between a 401 and a 403 from the API server?</li>
+<li>Where does Kubernetes get your group name when you use admin.conf?</li>
+<li>Why is a stolen admin certificate worse than a stolen password?</li>
+<li>Why does Kubernetes have a ServiceAccount object but no User object?</li>
+<li>Which ClusterRoleBinding went missing in our incident, and why didn't it come back by itself when the API server restarted?</li>
+</ol>
+
+<h2 class="pb">Answer key</h2>
+<ol class="answers">
+<li><b>c) kube-apiserver.</b> Everything else goes through it.</li>
+<li><b>kubelet and CRI-O.</b> Something has to exist before any pod can run: the kubelet starts pods, and CRI-O actually runs their containers.</li>
+<li>The <b>kubelet</b> on cka-w1 notices the assignment and asks <b>CRI-O</b> to pull the image and start it (Calico gives it an IP).</li>
+<li><b>b) crictl.</b> It talks to CRI-O on that node directly.</li>
+<li>Pods defined by files in <code>/etc/kubernetes/manifests/</code> that the kubelet runs <b>without the API server</b>. They solve the chicken-and-egg problem: the API server runs in a pod, but pods are normally created through the API server.</li>
+<li>Usually not. All control-plane pods start at once, and the API server retries until etcd is ready. Check <b>when</b> the restarts happened (did the count grow after boot?) before worrying.</li>
+<li>No CNI yet: the kubelet reports NetworkReady=false, so the node is NotReady and gets the <code>not-ready:NoSchedule</code> taint; CoreDNS doesn't tolerate that effect. Installing Calico fixes it.</li>
+<li>It's baked into certificates and kubeconfigs and is hard to change after init. A name or VIP can later point at a load balancer in front of several masters (HA); a node IP ties the cluster to one machine.</li>
+<li>A <b>fake API server</b>: the new node verifies that the cluster's CA matches the hash it was given, so it won't trust an impostor.</li>
+<li>Namespaced: Pod, Service, Secret, Deployment, ConfigMap, Role, PersistentVolumeClaim. Cluster-scoped: Node, Namespace, PersistentVolume, ClusterRole, StorageClass.</li>
+<li>It's shared infrastructure: it runs pods from every namespace at the same time, so it can't belong to any one of them.</li>
+<li>Cluster-scoped ones: CRDs, ClusterRoles, ClusterRoleBindings (and PVs). Deleting a namespace only deletes objects <i>inside</i> it. It happened with Argo CD.</li>
+<li>Allocatable = capacity minus kube-reserved, system-reserved and the eviction threshold (200 Mi for us), plus memory the kernel keeps. The scheduler uses <b>Allocatable</b>.</li>
+<li>The scheduler adds up <b>requests</b>, not real usage. If existing pods requested most of Allocatable, the node is "full" for scheduling even though it's idle.</li>
+<li>kubelet saw low disk → set <code>DiskPressure=True</code> and evicted a pod → node lifecycle controller (controller-manager) added the taint → scheduler avoided the node. After the disk was grown, the condition cleared and the taint was removed automatically.</li>
+<li>401 = authentication failed ("who are you?"). 403 = authenticated but not authorised by RBAC ("you may not").</li>
+<li>From the <b><code>O=</code> (organisation) field of the client certificate</b> inside admin.conf. The CN is the user name.</li>
+<li>Client certificates <b>can't be revoked</b> in Kubernetes; it stays valid until expiry (up to 1 year). A password can be changed or disabled in seconds, and often has a second factor.</li>
+<li>Humans are managed outside the cluster (certificates signed by the CA, or OIDC); Kubernetes just trusts the name and groups it's given. Programs live inside the cluster, so Kubernetes manages their identities itself.</li>
+<li><code>kubeadm:cluster-admins</code>. It's created by kubeadm, not part of the API server's bootstrap RBAC, so the API server doesn't reconcile it; only the built-in ClusterRoles/Bindings come back automatically.</li>
+</ol>
+</body></html>

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Audit, Incident, Rebuild</title>
+<link rel="stylesheet" href="study.css"></head><body>
+
+<section class="cover">
+  <div class="kicker">Phase 0 · Study notes 3 of 5</div>
+  <h1>Audit, Incident and Rebuild</h1>
+  <div class="sub">What we found when we inspected the cluster, how we lost the whole cluster state,<br>how we proved the root cause with evidence, and how we rebuilt it from a file in Git</div>
+  <div class="box"><span class="label">Why this is great interview material</span>
+  Interviewers ask "tell me about an incident you handled". This is a real one: symptoms, evidence, a wrong first hypothesis, root cause, recovery, and what changed afterwards. Learn to tell it in 2 minutes (section 7).</div>
+  <h3>Contents</h3>
+  <ol>
+    <li>Why audit before building</li>
+    <li>What the audit found</li>
+    <li>Fixing the disk (LVM) and cleaning up</li>
+    <li>The incident: 403 Forbidden for the admin</li>
+    <li>The investigation: evidence, not guesses</li>
+    <li>Root cause and contributing factors</li>
+    <li>How to tell this story in an interview</li>
+    <li>The rebuild: a cluster defined in Git</li>
+    <li>Lessons and habits</li>
+    <li>Quiz and answer key</li>
+  </ol>
+  <div class="meta">Events of 2026-09-23 · written 2026-09-25</div>
+</section>
+
+<h2 class="pb">1. Why audit before building</h2>
+<p>An architect never deploys onto infrastructure they haven't inspected. Before writing one YAML we need the facts: <b>which version? what's running? how much capacity is really there? which restrictions (taints) exist?</b></p>
+<div class="box warn"><span class="label">The first lesson came immediately</span>
+The plan assumed 2 GB workers. The audit measured <b>4 GB</b>. And it found a problem nobody had mentioned: <b>disk</b>. Always trust measured data over what anyone remembers, including yourself.</div>
+
+<h2>2. What the audit found</h2>
+<table>
+<tr><th>Item</th><th>Found</th><th>Verdict</th></tr>
+<tr><td>Kubernetes</td><td>v1.35.8, client = server</td><td>✅ no version skew</td></tr>
+<tr><td>Container runtime</td><td><b>CRI-O</b> (not containerd)</td><td>ℹ️ use <code>crictl</code> on nodes</td></tr>
+<tr><td>CNI</td><td>Calico manifest install, IPIP Always</td><td>✅ NetworkPolicy supported</td></tr>
+<tr><td>Pod CIDR</td><td>172.17.0.0/16</td><td>⚠️ same as Docker's bridge: never install Docker on nodes</td></tr>
+<tr><td>RAM</td><td>3.8 GiB per node, ~3.58 GiB allocatable</td><td>✅ much better than the 2 GB assumed</td></tr>
+<tr><td>Disk (root)</td><td>9.8–12 GB, 69 % / 78 % / <b>83 %</b> used</td><td>❌ <b>blocker</b></td></tr>
+<tr><td>Taints</td><td>cka-w2: <code>node.kubernetes.io/disk-pressure:NoSchedule</code></td><td>❌ cka-w2 can't take new pods; everything crowds onto cka-w1</td></tr>
+<tr><td>StorageClass / LoadBalancer</td><td>none</td><td>ℹ️ normal on kubeadm (Phases 5 and 7)</td></tr>
+<tr><td>Leftovers</td><td>Broken Argo CD, 8 practice nginx pods</td><td>⚠️ wasting RAM and disk</td></tr>
+<tr><td>Networking</td><td>2 NICs; ens34 at /8 overlapping the Service CIDR; node IPs on DHCP</td><td>⚠️ fixed (study notes 2)</td></tr>
+</table>
+
+<h2>3. Fixing the disk and cleaning up</h2>
+<h3>3.1 Why the disks were small</h3>
+<p>The Ubuntu installer with LVM gives the root volume only about <b>half</b> the disk by default and leaves the rest unused. We added a <b>40 GB disk (sdb)</b> to each VM and joined it to the volume group.</p>
+<p><b>LVM in plain words:</b> physical disks (PV) are poured into one big pool (VG); from the pool you cut logical volumes (LV) that the filesystem sits on. Adding a disk means making it a PV, adding it to the pool, and growing the LV.</p>
+<svg width="620" height="120" viewBox="0 0 620 120" role="img" aria-label="LVM layers">
+ <g font-family="Segoe UI, Arial" font-size="11">
+  <rect x="20" y="80" width="170" height="30" rx="4" fill="#f3f5f7" stroke="#999"/><text x="30" y="100">PV: sda3 (old disk)</text>
+  <rect x="210" y="80" width="170" height="30" rx="4" fill="#eaf7ee" stroke="#2e8b57"/><text x="220" y="100">PV: sdb (new 40 GB)</text>
+  <rect x="20" y="42" width="360" height="30" rx="4" fill="#eef5fc" stroke="#0b5cad"/><text x="30" y="62">VG: ubuntu-vg (the pool)</text>
+  <rect x="20" y="4" width="360" height="30" rx="4" fill="#fff4e5" stroke="#e69500"/><text x="30" y="24">LV: ubuntu-lv → ext4 filesystem mounted at /</text>
+  <text x="400" y="24">lvextend -r (LV + filesystem)</text>
+  <text x="400" y="62">vgextend ubuntu-vg /dev/sdb</text>
+  <text x="400" y="100">pvcreate /dev/sdb</text>
+ </g>
+</svg>
+<pre>sudo pvcreate /dev/sdb                                   # 1. make the new disk an LVM physical volume
+sudo vgextend ubuntu-vg /dev/sdb                         # 2. add it to the pool
+sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv   # 3. grow the volume; -r also grows the filesystem, online
+df -h /</pre>
+<p><b>Result:</b> 58–67 GB per node at ~13 % used. cka-w2's disk-pressure taint <b>cleared by itself</b>, because Kubernetes owns condition taints.</p>
+
+<h3>3.2 Cleanup, and a scope lesson</h3>
+<p>Deleting the <code>argocd</code> namespace left <b>3 CRDs and 6 ClusterRoles/Bindings</b> behind. They're <b>cluster-scoped</b>, so they don't live in any namespace. We deleted them separately.</p>
+
+<h2 class="pb">4. The incident: 403 Forbidden for the admin</h2>
+<svg width="680" height="130" viewBox="0 0 680 130" role="img" aria-label="Incident timeline">
+ <g font-family="Segoe UI, Arial" font-size="10.5">
+  <line x1="20" y1="60" x2="660" y2="60" stroke="#1f2328" stroke-width="2"/>
+  <circle cx="60" cy="60" r="6" fill="#2e8b57"/><text x="25" y="85">healthy cluster</text>
+  <circle cx="200" cy="60" r="7" fill="#c62828"/><text x="150" y="85">~15:17 host hangs</text><text x="150" y="100">VMs die hard (crash)</text>
+  <circle cx="340" cy="60" r="6" fill="#e69500"/><text x="300" y="85">15:34–15:37 reboot</text>
+  <circle cx="480" cy="60" r="6" fill="#c62828"/><text x="440" y="85">kubectl → 403</text><text x="440" y="100">for the admin</text>
+  <circle cx="620" cy="60" r="6" fill="#0b5cad"/><text x="570" y="85">investigate →</text><text x="570" y="100">rebuild</text>
+  <text x="140" y="30" fill="#c62828" font-weight="700">unclean shutdown on an HDD, no etcd backup</text>
+ </g>
+</svg>
+<ul>
+<li>The Windows laptop ran out of resources and <b>hung</b>. All three VMs died without a clean shutdown (<code>last -x</code> showed <code>crash</code>).</li>
+<li>After the restart, <code>kubectl</code> returned <b>403 Forbidden</b> for <code>kubernetes-admin</code>, both from cka-m and from Windows.</li>
+</ul>
+
+<h2>5. The investigation: evidence, not guesses</h2>
+<table>
+<tr><th>Evidence</th><th>What it meant</th></tr>
+<tr><td><code>kubectl auth whoami</code> worked; group <code>kubeadm:cluster-admins</code>; binding <code>kubeadm:cluster-admins</code> <b>NotFound</b></td><td>403 = authentication OK, <b>RBAC denied</b>. Since kubeadm 1.29, admin.conf gets its power from that binding (not <code>system:masters</code>)</td></tr>
+<tr><td>Every ClusterRole/Binding, and the namespaces <code>default</code>/<code>kube-system</code>, had a <b>creation time of 15:36 today</b></td><td>The API server had re-created its built-in objects on an almost <b>empty etcd</b></td></tr>
+<tr><td>Only 4 static pods left; no calico-node, CoreDNS, kube-proxy; no CRDs; cka-m lost its control-plane label</td><td>All state that wasn't built-in was <b>gone</b></td></tr>
+<tr><td><code>kube-system</code> can't be deleted through the API</td><td>Rules out a human <code>kubectl delete</code>: data vanished <b>underneath</b> the API server</td></tr>
+<tr><td>etcd log: DB in use only 25 kB; <code>consistentIndex 80323</code> &gt; WAL <code>commit-index 80308</code></td><td>The database was <b>ahead of its own write-ahead log</b>. Impossible if saved writes are really durable → acknowledged writes were lost</td></tr>
+<tr><td>etcd log: opening the DB took 2.8 s; VM disks on <b>E: (HDD)</b></td><td>Slow storage under etcd</td></tr>
+</table>
+<div class="box bad"><span class="label">A mistake in the investigation, recorded honestly</span>
+The first hypothesis blamed the Argo CD cleanup ("a delete must have removed the binding"). That was wrong. <b>One missing object is not the same as a targeted delete.</b> Checking the creation timestamps of <i>everything</i> showed the real picture: the whole store had been reset.</div>
+
+<h2 class="pb">6. Root cause and contributing factors</h2>
+<div class="box warn"><span class="label">Root cause</span>
+The host hung, the VMs were hard-powered-off, and writes that etcd believed were saved were lost (host/VMware write caching on an HDD). etcd was left internally inconsistent. <b>One etcd member + no backup = total loss of cluster state.</b></div>
+<h3>Contributing factors</h3>
+<ul>
+<li><b>Host memory:</b> 16 GB laptop, 3 VMs × 4 GB. Commit charge 14.7 of 18.1 GB with only the VMs running, so VS Code and a browser could push it over the edge.</li>
+<li><b>No etcd backup</b> existed.</li>
+<li>VMs weren't shut down before heavy use of the host.</li>
+</ul>
+<h3>What we changed</h3>
+<table>
+<tr><th>Change</th><th>Why</th></tr>
+<tr><td>Windows page file 8–16 GB on the SSD (commit limit now ~24 GB)</td><td>More headroom before the host hangs</td></tr>
+<tr><td>VMware "fit all VM memory into reserved host RAM", 12 GB reserved</td><td>VMs don't get swapped out by the host</td></tr>
+<tr><td>cka-m reduced to 3 GB</td><td>Less memory pressure on the host</td></tr>
+<tr><td>Clean shutdown order w2 → w1 → m before heavy host use</td><td>No more hard power-offs</td></tr>
+<tr><td>Automated etcd backups + restore drill (study notes 4)</td><td>Next time, restore instead of rebuild</td></tr>
+</table>
+<p><b>Interesting finding afterwards:</b> the WAL fsync average was <b>1.5 ms</b> on an HDD, which is "too good". Most likely VMware acknowledges fsync from its write cache before the data reaches the disk. That's fast, and it's exactly why acknowledged writes were lost in the crash. We kept the disks and got protection from off-node backups and clean shutdowns instead.</p>
+
+<h2>7. How to tell this story in an interview (STAR)</h2>
+<table>
+<tr><th>Part</th><th>What to say</th></tr>
+<tr><td><b>Situation</b></td><td>"In my kubeadm lab, the host hung and all VMs were powered off hard. Afterwards the admin got 403 on every request."</td></tr>
+<tr><td><b>Task</b></td><td>"Find out why, restore a working cluster, and make sure it can't happen the same way again."</td></tr>
+<tr><td><b>Action</b></td><td>"whoami showed authentication was fine, so it was RBAC. The kubeadm:cluster-admins binding was missing. My first guess, an accidental delete, was wrong: creation timestamps showed every built-in object had just been re-created, and the etcd log showed the DB index ahead of the WAL, meaning acknowledged writes were lost. With one etcd member and no backup, repair wasn't trustworthy, so I rebuilt from a versioned kubeadm config."</td></tr>
+<tr><td><b>Result</b></td><td>"The cluster came back identical, from Git. I added automated etcd snapshots with a systemd timer, copies off the node, and a tested restore drill, plus host memory fixes and a shutdown procedure."</td></tr>
+</table>
+
+<h2 class="pb">8. The rebuild: a cluster defined in Git</h2>
+<p>We rebuilt instead of repairing, because an etcd store in an unknown state produces bugs you can never explain. Nothing of GaramChai was deployed yet, so nothing was lost that mattered.</p>
+<h3>8.1 What <code>kubeadm reset</code> keeps and wipes</h3>
+<table>
+<tr><th>Survives</th><th>Wiped</th></tr>
+<tr><td>OS, CRI-O, kubeadm/kubelet/kubectl packages, cached images, <code>/etc/default/kubelet</code></td><td><code>/etc/kubernetes</code> (certs, kubeconfigs, manifests), <code>/var/lib/etcd</code>, kubelet state</td></tr>
+</table>
+<p>Not cleaned by reset, so we did it ourselves: <code>/etc/cni/net.d</code>, <code>/var/lib/calico</code>, iptables rules, <code>~/.kube</code>. Then a reboot, for a clean slate.</p>
+
+<h3>8.2 The steps (R1–R10)</h3>
+<table>
+<tr><th>Step</th><th>What</th><th>Why</th></tr>
+<tr><td>R1</td><td>Split-horizon <code>k8s-api</code> in both hosts files</td><td>A stable API name for nodes and Windows</td></tr>
+<tr><td>R2</td><td><code>kubeadm config validate</code> <b>before</b> destroying anything</td><td>It caught 2 real problems (below)</td></tr>
+<tr><td>R3</td><td>Reset all nodes, workers first, and reboot</td><td>Clean slate</td></tr>
+<tr><td>R4</td><td><code>kubeadm init --config kubeadm-config.yaml</code></td><td>Repeatable build</td></tr>
+<tr><td>R5</td><td>Check the API server certificate SANs (<code>k8s-api</code>, 10.0.0.100, 10.96.0.1)</td><td>TLS works from everywhere</td></tr>
+<tr><td>R6</td><td>Calico v3.32.0 with pool 172.17.0.0/16 and <code>IP_AUTODETECTION_METHOD=cidr=10.0.0.0/24</code></td><td>Same network as before, pinned NIC</td></tr>
+<tr><td>R7</td><td>Join the workers</td><td>—</td></tr>
+<tr><td>R8</td><td>Verify: DNS (FQDN) and pod-to-pod over <b>TCP</b></td><td>Prove the whole path</td></tr>
+<tr><td>R9</td><td>Windows kubectl via <code>https://k8s-api:6443</code>, no TLS workaround</td><td>—</td></tr>
+<tr><td>R10</td><td>etcd backups: manual → off the node → automated + restore drill</td><td>Never again</td></tr>
+</table>
+
+<h3>8.3 Validation saved us twice</h3>
+<ol>
+<li>The old config (from Sep 6) had a <b>duplicate key</b> (<code>serializeImagePulls</code>) that kubeadm 1.35 rejects in strict mode. A rebuild with it would have failed half-way through <code>init</code>.</li>
+<li>The new config started with <code>---</code> after the header comments, which creates an <b>empty first document</b> ("kind and apiVersion is mandatory"). <code>---</code> goes only <i>between</i> documents.</li>
+</ol>
+<div class="box ok"><span class="label">Habit</span>Validate (<code>kubeadm config validate</code>, <code>kubectl apply --dry-run=server</code>) <b>before</b> anything destructive.</div>
+
+<h2>9. Lessons and habits</h2>
+<table>
+<tr><th>Lesson</th><th>Habit</th></tr>
+<tr><td>Measured data beat the plan (2 GB vs 4 GB)</td><td>Audit first, always</td></tr>
+<tr><td>One missing object ≠ a targeted delete</td><td>Check timestamps of <i>everything</i> before naming a cause</td></tr>
+<tr><td>No backup = no recovery</td><td>Back up etcd <b>and</b> the PKI from day 1, off the node, and test restores</td></tr>
+<tr><td>Hard power-offs lose "saved" data</td><td>Shut down cleanly: w2 → w1 → m</td></tr>
+<tr><td>Output didn't match "expect" and we carried on</td><td>Output ≠ expected → stop and ask</td></tr>
+<tr><td>A per-node value was pasted on the wrong node (<code>--node-ip</code>)</td><td>Check per-server values before pressing Enter</td></tr>
+<tr><td><code>~</code> is <code>/root</code> for root, <code>/home/redhat</code> for redhat</td><td>Use full paths with sudo; don't work in a root shell</td></tr>
+<tr><td>Static-pod restart counts were inherited from before the reset</td><td>Check <b>when</b> restarts happened</td></tr>
+<tr><td>CoreDNS Pending: it tolerated <code>not-ready</code> only as NoExecute</td><td>A toleration must match key <b>and</b> effect</td></tr>
+</table>
+
+<h2 class="pb">10. Quiz</h2>
+<ol class="quiz">
+<li>Name two findings from the audit that contradicted what we believed before.</li>
+<li>Explain LVM's PV, VG and LV using the pool analogy, and the three commands used to add a disk.</li>
+<li>Why did cka-w2's taint disappear without anyone removing it?</li>
+<li>Deleting the argocd namespace left objects behind. Which kind, and why?</li>
+<li>The admin gets 403. <code>kubectl auth whoami</code> works. What does that tell you immediately?</li>
+<li>Which single piece of evidence ruled out "someone deleted it with kubectl"?</li>
+<li>What did <code>consistentIndex 80323 &gt; commit-index 80308</code> tell us?</li>
+<li>What was wrong with the first hypothesis, and what's the general lesson?</li>
+<li>State the root cause in one sentence.</li>
+<li>Why did we rebuild instead of trying to repair etcd?</li>
+<li>What does <code>kubeadm reset</code> NOT clean up?</li>
+<li>Name the two problems <code>kubeadm config validate</code> caught.</li>
+<li>Why is <code>controlPlaneEndpoint</code> set to <code>k8s-api:6443</code>?</li>
+<li>Why was a 1.5 ms fsync on an HDD suspicious rather than good news?</li>
+<li>Tell the incident as a STAR story in four sentences.</li>
+</ol>
+
+<h2 class="pb">Answer key</h2>
+<ol class="answers">
+<li>Workers had 4 GB, not 2 GB; disk (not RAM) was the real problem; the runtime was CRI-O, not containerd.</li>
+<li>PVs (disks) are poured into a VG (the pool); LVs are cut from the pool and carry the filesystem. <code>pvcreate /dev/sdb</code>, <code>vgextend ubuntu-vg /dev/sdb</code>, <code>lvextend -r -l +100%FREE …</code>.</li>
+<li>It's a condition taint owned by Kubernetes: once free disk rose above the threshold, the kubelet cleared DiskPressure and the controller removed the taint.</li>
+<li>Cluster-scoped objects (CRDs, ClusterRoles, ClusterRoleBindings): they're not inside any namespace, so a namespace delete doesn't touch them.</li>
+<li>Authentication works; authorization (RBAC) fails. Look for the missing Role/Binding.</li>
+<li><code>kube-system</code> itself had been re-created, and it can't be deleted through the API, so the data vanished underneath the API server.</li>
+<li>The database was ahead of its write-ahead log: writes that had been acknowledged as durable weren't actually on disk. Storage lost data.</li>
+<li>It explained one missing object with a targeted delete. Lesson: check creation timestamps of everything before naming a cause.</li>
+<li>A hard power-off lost writes etcd believed were durable, leaving a single-member etcd inconsistent, and there was no backup to restore.</li>
+<li>An etcd store in an unknown state produces unexplainable bugs, nothing important was deployed, and a versioned config made the rebuild repeatable.</li>
+<li><code>/etc/cni/net.d</code>, <code>/var/lib/calico</code>, iptables rules, users' <code>~/.kube</code>.</li>
+<li>A duplicate <code>serializeImagePulls</code> key in the old config; a leading <code>---</code> creating an empty first document.</li>
+<li>A stable name (not a node IP) that can later point at a load balancer for HA; it's baked into certs and kubeconfigs and hard to change after init.</li>
+<li>An HDD can't really persist in 1.5 ms; the host was acknowledging from its write cache, which is exactly how "saved" writes were lost in the crash.</li>
+<li>See section 7: host hang → admin 403; whoami showed RBAC; timestamps + etcd index proved storage loss; rebuilt from Git and added tested backups and host fixes.</li>
+</ol>
+</body></html>

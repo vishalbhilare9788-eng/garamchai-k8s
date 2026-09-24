@@ -24,9 +24,10 @@ Become confident, interview-ready (SME level) on every Kubernetes object by buil
 - No public DNS: hostname `garamchai.test` via the Windows hosts file
 
 ## 🚨 Current state (2026-09-24)
-Cluster rebuilt and healthy. etcd backups automated (systemd timer, every 6 h) and a restore drill passed (see `journal/2026-09-24.md`). **Next: R10c-4 (automatic copy of backups to Windows), then the Phase 0 self-check, then Phase 1 requirements.**
+Cluster rebuilt and healthy. etcd backups automated (systemd timer, every 6 h) and a restore drill passed (see `journal/2026-09-24.md`). Phase 0 done 2026-09-25. **Next: Phase 1, resume at the Operations section (see `journal/2026-09-25.md`).** R10c-4 deferred until before Phase 3.
 
 ## ⏰ Open reminders (remind Vishal at the right time)
+- **Before Phase 3 (first deployment):** R10c-4, automatic pull of etcd backups to Windows (dedicated read-only user + SSH key + Task Scheduler). Deferred on 2026-09-24 because nothing of GaramChai is in etcd yet
 - **Before Phase 5 (storage):** Vishal will add a dedicated **100 GB disk to cka-m** for NFS data (keep it separate from `/`, mount at `/srv/nfs`). Needs VM time, so remind at the end of Phase 4. Tip: VMware Workstation can usually hot-add a SCSI disk without a reboot (then rescan with `echo "- - -" | sudo tee /sys/class/scsi_host/host*/scan`)
 
 ## Key decisions (see docs/adr/)

@@ -305,4 +305,4 @@ git status; git add -A; git commit -m "what I did"; git push
 - [x] `/home/redhat/admin.conf` deleted on cka-m
 - [x] 0.3 Repo pushed to GitHub: github.com/vishalbhilare9788-eng/garamchai-k8s (public), first commit d1f3519 on 2026-09-23
 - [x] Node IPs: the cluster network (ens34) is static. ens33 is still DHCP, but since the rebuild only the Windows hosts entry for `k8s-api` depends on it
-- [ ] Self-check: explain to Claude (1) Capacity vs Allocatable, (2) why cka-w2 got a taint you never added, (3) namespaced vs cluster-scoped objects
+- [x] Self-check (2026-09-25): explain to Claude (1) Capacity vs Allocatable, (2) why cka-w2 got a taint you never added, (3) namespaced vs cluster-scoped objects
