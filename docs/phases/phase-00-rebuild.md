@@ -135,7 +135,75 @@ First snapshot: revision 4794, 505 keys, 3.6 MB. WAL fsync average 1.5 ms (fast 
 ### R10b: copy off the node (Windows, outside the repo) (done 2026-09-23)
 On cka-m: `install -d -o redhat -m 700 /home/redhat/etcd-export && install -o redhat -m 600 /var/backups/etcd/* /home/redhat/etcd-export/`
 On Windows: `scp "redhat@192.168.64.128:etcd-export/*" C:\k8s-backups\etcd\`, then on cka-m `rm -rf /home/redhat/etcd-export`. Compare sizes or hashes on both sides.
-### R10c: automate (systemd timer) + restore drill: next session
+### R10c: automate (systemd timer) + restore drill
+Files: [infra/etcd-backup/](../../infra/etcd-backup/): `etcd-backup.sh` (what), `etcd-backup.service` (how to run it), `etcd-backup.timer` (when).
+
+**Why a systemd timer and not cron or a Kubernetes CronJob?**
+- vs cron: `Persistent=true` catches up on runs missed while the VM was off (our VMs are off most of the time). Output goes to the journal (`journalctl -u etcd-backup`), and `systemctl list-timers` shows the last and next run.
+- vs a CronJob: a backup of the cluster should not depend on the cluster. If the scheduler, CNI or API server is broken, that is exactly the day you need a backup.
+
+**R10c-1: install and test by hand** (Windows, then cka-m)
+```powershell
+scp G:\k8S-with-claude\infra\etcd-backup\etcd-backup.* redhat@192.168.64.128:
+```
+```bash
+sudo install -m 750 etcd-backup.sh /usr/local/sbin/
+sudo install -m 644 etcd-backup.service etcd-backup.timer /etc/systemd/system/
+rm etcd-backup.sh etcd-backup.service etcd-backup.timer
+sudo systemd-analyze verify /etc/systemd/system/etcd-backup.{service,timer}   # no output = OK
+sudo systemctl daemon-reload
+sudo systemctl start etcd-backup.service          # one manual run BEFORE trusting the timer
+systemctl status etcd-backup.service --no-pager   # expect: inactive (dead) + "Deactivated successfully" (failure = "Failed with result 'exit-code'")
+sudo journalctl -u etcd-backup -n 30 --no-pager   # expect the status table and "OK: ..."
+sudo ls -l /var/backups/etcd                      # expect -rw------- root root on every file
+```
+
+**R10c-2: enable the timer**
+```bash
+sudo systemctl enable --now etcd-backup.timer
+systemctl list-timers etcd-backup.timer           # NEXT should be the next 00/06/12/18 h (+ up to 5 min)
+```
+
+Done 2026-09-24: manual run OK (revision 10111, 532 keys, 4.4 MB); timer enabled, first scheduled run 18:02:59 UTC (18:00 + random delay). Clock NTP-synchronized.
+`LAST` shows `-` right after enabling: a manual `systemctl start` of the service doesn't count as a timer run, and `Persistent=true` only catches up once the timer has a stamp from a previous run.
+
+**R10c-3: restore drill** (done 2026-09-24): prove the backup works by undoing a change.
+The drill: snapshot at 16:58 → `kubectl create ns drill` → restore the 16:58 snapshot → `drill` must be gone.
+
+```bash
+# 0. Identity values for the restore: read them, never guess (a restore writes a NEW member list)
+sudo grep -E -- '--(name|data-dir|initial-cluster|initial-advertise-peer-urls)=' /etc/kubernetes/manifests/etcd.yaml
+sudo grep -B1 -A2 'path: /var/lib/etcd' /etc/kubernetes/manifests/etcd.yaml   # hostPath = the folder on the node
+
+# A. Restore into a NEW folder (the live etcd is not touched)
+sudo etcdutl snapshot restore /var/backups/etcd/etcd-2026-09-24-1658.db \
+  --data-dir=/var/lib/etcd-restore --name=cka-m \
+  --initial-cluster=cka-m=https://10.0.0.100:2380 \
+  --initial-advertise-peer-urls=https://10.0.0.100:2380 \
+  --bump-revision=1000000000 --mark-compacted       # revision jumps ahead, so controllers re-list instead of trusting stale caches
+
+# B. Stop ALL static pods (they keep cluster state in memory), wait until they're gone
+sudo mkdir /etc/kubernetes/manifests-stopped
+sudo mv /etc/kubernetes/manifests/*.yaml /etc/kubernetes/manifests-stopped/
+sudo crictl ps --name '^(etcd|kube-apiserver|kube-controller-manager|kube-scheduler)$'   # repeat until empty
+
+# C. Swap folders (keep the old one as the way back)
+sudo mv /var/lib/etcd /var/lib/etcd.before-drill
+sudo mv /var/lib/etcd-restore /var/lib/etcd
+
+# D. Start again
+sudo mv /etc/kubernetes/manifests-stopped/*.yaml /etc/kubernetes/manifests/
+sudo rmdir /etc/kubernetes/manifests-stopped
+sudo systemctl restart kubelet
+
+# E. Verify: drill gone, nodes Ready, pods Running; then delete /var/lib/etcd.before-drill (it contains every Secret)
+```
+Rollback if the API server isn't back in 5 min: repeat B, move the failed folder aside, move `etcd.before-drill` back to `/var/lib/etcd`, repeat D.
+
+Result: restore log `latest-revision 12718 → 1000012718`, member `https://10.0.0.100:2380`. About 30 s after the kubelet restart, all 4 static pods were at attempt 0; `drill` was gone; 3 nodes Ready. calico-kube-controllers restarted once (it lost the API server during the swap), which is expected.
+
+Why swap the folders instead of pointing `hostPath` in etcd.yaml at the new folder (the usual exam shortcut)? The manifest stays identical to what kubeadm generated. A later `kubeadm upgrade` regenerates etcd.yaml with `/var/lib/etcd`, and with the shortcut that would silently switch the cluster back to the old data.
+**R10c-4: automatic copy to Windows** (backups on cka-m don't survive the loss of cka-m): after the drill.
 
 ---
 
@@ -151,4 +219,5 @@ On Windows: `scp "redhat@192.168.64.128:etcd-export/*" C:\k8s-backups\etcd\`, th
 - [x] R9 Windows kubectl works via `k8s-api`
 - [x] R10a first etcd snapshot + PKI backup taken and verified
 - [x] R10b backups copied to Windows (off the node)
-- [ ] R10c scheduled backups (systemd timer) + restore drill
+- [x] R10c scheduled backups (systemd timer) + restore drill
+- [ ] R10c-4 automatic copy of backups to Windows
