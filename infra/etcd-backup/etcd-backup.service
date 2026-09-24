@@ -1,0 +1,15 @@
+# /etc/systemd/system/etcd-backup.service
+# What to run. Started by etcd-backup.timer (or by hand: systemctl start etcd-backup.service).
+[Unit]
+Description=etcd snapshot + PKI backup (GaramChai lab)
+# Order after kubelet so a boot-time run doesn't start before the etcd static pod can exist
+After=kubelet.service
+
+[Service]
+# oneshot = run to completion and exit; the unit is "active" only while the script runs
+Type=oneshot
+ExecStart=/usr/local/sbin/etcd-backup.sh
+# Be polite to the API server: etcd shares this HDD-backed VM
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

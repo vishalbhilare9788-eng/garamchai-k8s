@@ -40,3 +40,5 @@ Thumbs.db
 *.snapshot
 kubeadm-init.log
 etcd-backup*/
+# ...but the backup TOOLING (script + systemd units, no data) belongs in Git
+!infra/etcd-backup/

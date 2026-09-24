@@ -1,0 +1,16 @@
+# /etc/systemd/system/etcd-backup.timer
+# When to run. A timer starts the .service with the same name.
+[Unit]
+Description=Run etcd-backup.service every 6 hours
+
+[Timer]
+# 00:00, 06:00, 12:00, 18:00
+OnCalendar=*-*-* 00/6:00:00
+# The lab VMs are often off. Persistent=true runs a missed backup as soon as the VM boots.
+Persistent=true
+# Spread the start a little (matters when many machines share one schedule; harmless here)
+RandomizedDelaySec=5min
+
+[Install]
+# "enable" hooks the timer into timers.target, so it survives reboots
+WantedBy=timers.target
